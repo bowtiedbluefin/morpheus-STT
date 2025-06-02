@@ -51,7 +51,7 @@ async def transcribe_info():
 async def transcribe_audio(
     request: Request,
     file: UploadFile = File(...),
-    model: str = Form("whisper-1", description="Model to use (ignored, handled by API gateway)"),
+    model_name: str = Form("whisper-1", description="Model to use (ignored, handled by API gateway)"),
     language: Optional[str] = Form(None, description="Language code (e.g., 'en', 'es', 'fr') or None for auto-detection"),
     prompt: Optional[str] = Form(None, description="Initial prompt to condition the model"),
     response_format: ResponseFormat = Form(ResponseFormat.json, description="Output format"),
@@ -239,7 +239,7 @@ async def transcribe_audio(
 async def transcribe_audio_alias(
     request: Request,
     file: UploadFile = File(...),
-    model: str = Form("whisper-1", description="Model to use (ignored, handled by API gateway)"),
+    model_name: str = Form("whisper-1", description="Model to use (ignored, handled by API gateway)"),
     language: Optional[str] = Form(None, description="Language code (e.g., 'en', 'es', 'fr') or None for auto-detection"),
     prompt: Optional[str] = Form(None, description="Initial prompt to condition the model"),
     response_format: ResponseFormat = Form(ResponseFormat.json, description="Output format"),
@@ -250,7 +250,7 @@ async def transcribe_audio_alias(
     return await transcribe_audio(
         request=request,
         file=file,
-        model=model,
+        model_name=model_name,
         language=language,
         prompt=prompt,
         response_format=response_format,
