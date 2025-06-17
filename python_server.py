@@ -122,6 +122,7 @@ async def transcribe_audio(
             vad_parameters=enhanced_vad_params,
             initial_prompt=prompt,
             temperature=temperature,
+            condition_on_previous_text=False,       # Prevent repetition in long audio
             word_timestamps=(selected_granularity == TimestampGranularity.word)
         )
     else:
@@ -135,6 +136,7 @@ async def transcribe_audio(
             vad_parameters=enhanced_vad_params,
             initial_prompt=prompt,
             temperature=temperature,
+            condition_on_previous_text=False,       # Prevent repetition in long audio
             word_timestamps=(selected_granularity == TimestampGranularity.word)
         )
     print("Transcription complete")
@@ -173,6 +175,7 @@ async def transcribe_audio(
                         vad_parameters=enhanced_vad_params,
                         initial_prompt=prompt,
                         temperature=temperature,
+                        condition_on_previous_text=False,       # Prevent repetition in long audio
                         word_timestamps=True
                     )
                 else:
@@ -185,6 +188,7 @@ async def transcribe_audio(
                         vad_parameters=enhanced_vad_params,
                         initial_prompt=prompt,
                         temperature=temperature,
+                        condition_on_previous_text=False,       # Prevent repetition in long audio
                         word_timestamps=True
                     )
                 
@@ -241,6 +245,7 @@ async def transcribe_audio(
                             vad_parameters=enhanced_vad_params,
                             initial_prompt=prompt,
                             temperature=temperature,
+                            condition_on_previous_text=False,       # Prevent repetition in long audio
                             word_timestamps=False
                         )
                     else:
@@ -253,6 +258,7 @@ async def transcribe_audio(
                             vad_parameters=enhanced_vad_params,
                             initial_prompt=prompt,
                             temperature=temperature,
+                            condition_on_previous_text=False,       # Prevent repetition in long audio
                             word_timestamps=False
                         )
                 
