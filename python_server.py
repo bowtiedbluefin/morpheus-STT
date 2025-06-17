@@ -1,7 +1,7 @@
 #https://github.com/SYSTRAN/faster-whisper
 
 from fastapi import FastAPI, UploadFile, File, Form, Query, Request
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 import uvicorn
 import tempfile
 import os
@@ -37,6 +37,8 @@ if torch.cuda.is_available():
 
 # Initialize model with explicit CUDA settings
 model = WhisperModel("large-v3", device="cuda", compute_type="float16", download_root="./models")
+# Initialize batched model for long audio processing
+batched_model = BatchedInferencePipeline(model=model)
 
 @app.get("/")
 async def root():
@@ -55,8 +57,11 @@ async def transcribe_audio(
     language: Optional[str] = Form(None, description="Language code (e.g., 'en', 'es', 'fr') or None for auto-detection"),
     prompt: Optional[str] = Form(None, description="Initial prompt to condition the model"),
     response_format: ResponseFormat = Form(ResponseFormat.json, description="Output format"),
-    temperature: float = Form(0.0, ge=0.0, le=1.0, description="Sampling temperature (0.0-1.0)"),
-    output_content: OutputContent = Form(OutputContent.both, description="What to include in JSON response (extended feature)")
+    temperature: float = Form(0.0, ge=0.0, le=1.0, description="Sampling temperature (0.0-1.0) - default 0.0 for deterministic output"),
+    output_content: OutputContent = Form(OutputContent.both, description="What to include in JSON response (extended feature)"),
+    use_batched: bool = Form(True, description="Use batched processing for long audio (recommended, default: enabled)"),
+    batch_size: int = Form(8, ge=1, le=64, description="Batch size for batched processing (default: 8 for quality)"),
+    max_speech_duration: float = Form(20.0, ge=5.0, le=120.0, description="Maximum speech segment duration in seconds (default: 20s for quality)")
 ):
     """OpenAI-compatible transcription endpoint with extended features"""
     # Parse timestamp_granularities from form data (handles array format timestamp_granularities[])
@@ -85,7 +90,7 @@ async def transcribe_audio(
     else:
         selected_granularity = TimestampGranularity.segment
     
-    print(f"Starting transcription with params: language={language}, prompt={prompt}, format={response_format}, temp={temperature}, granularity={selected_granularity}, content={output_content}")
+    print(f"Starting transcription with params: language={language}, prompt={prompt}, format={response_format}, temp={temperature}, granularity={selected_granularity}, content={output_content}, batched={use_batched}, batch_size={batch_size}")
     
     #Save uploaded file temporarily
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
@@ -95,16 +100,43 @@ async def transcribe_audio(
 
     #Process with Faster-Whisper
     print("Processing with Whisper...")
-    segments, info = model.transcribe(
+    
+    # Enhanced VAD parameters optimized for quality on long audio
+    enhanced_vad_params = dict(
+        threshold=0.2,                              # More sensitive VAD for better speech detection
+        min_silence_duration_ms=800,                # Shorter silence threshold for better segmentation
+        min_speech_duration_ms=200,                 # Shorter minimum speech for better granularity
+        max_speech_duration_s=max_speech_duration,  # Maximum speech segment (chunking)
+        speech_pad_ms=300                           # Moderate padding around speech
+    )
+    
+    if use_batched:
+        # Use batched processing for long audio
+        segments, info = batched_model.transcribe(
             temp_file.name,
             language=language,
-            beam_size=5,
+            batch_size=batch_size,
+            beam_size=8,                            # Higher beam size for better quality
+            best_of=8,                              # More candidates for better quality
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
+            vad_parameters=enhanced_vad_params,
             initial_prompt=prompt,
             temperature=temperature,
             word_timestamps=(selected_granularity == TimestampGranularity.word)
-    )
+        )
+    else:
+        # Use standard processing with quality optimizations
+        segments, info = model.transcribe(
+            temp_file.name,
+            language=language,
+            beam_size=8,                            # Higher beam size for better quality
+            best_of=8,                              # More candidates for better quality
+            vad_filter=True,
+            vad_parameters=enhanced_vad_params,
+            initial_prompt=prompt,
+            temperature=temperature,
+            word_timestamps=(selected_granularity == TimestampGranularity.word)
+        )
     print("Transcription complete")
 
     #Collect results based on format and granularity
@@ -130,16 +162,31 @@ async def transcribe_audio(
             if output_content in [OutputContent.timestamps_only, OutputContent.both]:
                 result["words"] = []
                 # Reset segments iterator
-                segments, _ = model.transcribe(
-                    temp_file.name,
-                    language=language,
-                    beam_size=5,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500),
-                    initial_prompt=prompt,
-                    temperature=temperature,
-                    word_timestamps=True
-                )
+                if use_batched:
+                    segments, _ = batched_model.transcribe(
+                        temp_file.name,
+                        language=language,
+                        batch_size=batch_size,
+                        beam_size=8,
+                        best_of=8,
+                        vad_filter=True,
+                        vad_parameters=enhanced_vad_params,
+                        initial_prompt=prompt,
+                        temperature=temperature,
+                        word_timestamps=True
+                    )
+                else:
+                    segments, _ = model.transcribe(
+                        temp_file.name,
+                        language=language,
+                        beam_size=8,
+                        best_of=8,
+                        vad_filter=True,
+                        vad_parameters=enhanced_vad_params,
+                        initial_prompt=prompt,
+                        temperature=temperature,
+                        word_timestamps=True
+                    )
                 
                 for segment in segments:
                     if hasattr(segment, 'words') and segment.words:
@@ -183,16 +230,31 @@ async def transcribe_audio(
                 result["segments"] = []
                 # Reset segments iterator if we already consumed it
                 if output_content == OutputContent.timestamps_only:
-                    segments, _ = model.transcribe(
-                        temp_file.name,
-                        language=language,
-                        beam_size=5,
-                        vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=500),
-                        initial_prompt=prompt,
-                        temperature=temperature,
-                        word_timestamps=False
-                    )
+                    if use_batched:
+                        segments, _ = batched_model.transcribe(
+                            temp_file.name,
+                            language=language,
+                            batch_size=batch_size,
+                            beam_size=8,                            # Higher beam size for better quality
+                            best_of=8,                              # More candidates for better quality
+                            vad_filter=True,
+                            vad_parameters=enhanced_vad_params,
+                            initial_prompt=prompt,
+                            temperature=temperature,
+                            word_timestamps=False
+                        )
+                    else:
+                        segments, _ = model.transcribe(
+                            temp_file.name,
+                            language=language,
+                            beam_size=8,                            # Higher beam size for better quality
+                            best_of=8,                              # More candidates for better quality
+                            vad_filter=True,
+                            vad_parameters=enhanced_vad_params,
+                            initial_prompt=prompt,
+                            temperature=temperature,
+                            word_timestamps=False
+                        )
                 
                 for segment in segments:
                     result["segments"].append({
@@ -243,8 +305,11 @@ async def transcribe_audio_alias(
     language: Optional[str] = Form(None, description="Language code (e.g., 'en', 'es', 'fr') or None for auto-detection"),
     prompt: Optional[str] = Form(None, description="Initial prompt to condition the model"),
     response_format: ResponseFormat = Form(ResponseFormat.json, description="Output format"),
-    temperature: float = Form(0.0, ge=0.0, le=1.0, description="Sampling temperature (0.0-1.0)"),
-    output_content: OutputContent = Form(OutputContent.both, description="What to include in JSON response (extended feature)")
+    temperature: float = Form(0.0, ge=0.0, le=1.0, description="Sampling temperature (0.0-1.0) - default 0.0 for deterministic output"),
+    output_content: OutputContent = Form(OutputContent.both, description="What to include in JSON response (extended feature)"),
+    use_batched: bool = Form(True, description="Use batched processing for long audio (recommended, default: enabled)"),
+    batch_size: int = Form(8, ge=1, le=64, description="Batch size for batched processing (default: 8 for quality)"),
+    max_speech_duration: float = Form(20.0, ge=5.0, le=120.0, description="Maximum speech segment duration in seconds (default: 20s for quality)")
 ):
     """Alias to the main transcription endpoint - same functionality"""
     return await transcribe_audio(
@@ -255,7 +320,10 @@ async def transcribe_audio_alias(
         prompt=prompt,
         response_format=response_format,
         temperature=temperature,
-        output_content=output_content
+        output_content=output_content,
+        use_batched=use_batched,
+        batch_size=batch_size,
+        max_speech_duration=max_speech_duration
     )
 
 def format_timestamp_srt(seconds):
