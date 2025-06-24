@@ -1,0 +1,58 @@
+---
+version: "2.0"
+
+services:
+  whisper-api:
+    image: your-dockerhub-username/whisper-transcription-api:latest
+    expose:
+      - port: 3333
+        as: 80
+        to:
+          - global: true
+    params:
+      storage:
+        models:
+          mount: /app/models
+          readOnly: false
+    env:
+      - "PYTHONUNBUFFERED=1"
+
+profiles:
+  compute:
+    whisper-api:
+      resources:
+        cpu:
+          units: 4.0
+        memory:
+          size: 16Gi
+        gpu:
+          units: 1
+          attributes:
+            vendor:
+              nvidia:
+                - model: rtx4090
+                - model: rtx4080
+                - model: rtx3090
+                - model: rtx3080
+                - model: a6000
+                - model: v100
+        storage:
+          - size: 30Gi
+            name: models
+  placement:
+    dcloud:
+      attributes:
+        host: akash
+      signedBy:
+        anyOf:
+          - "akash1365yvmc4s7awdyj3n2sav7xfx76adc6dnmlx63"
+      pricing:
+        whisper-api: 
+          denom: uakt
+          amount: 6000
+
+deployment:
+  whisper-api:
+    dcloud:
+      profile: whisper-api
+      count: 1 
