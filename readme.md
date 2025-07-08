@@ -1,11 +1,41 @@
 # Whisper Transcription API
 
+## Features
+
+- **OpenAI-Compatible API**: Drop-in replacement for OpenAI's Whisper API
+- **Multiple Output Formats**: JSON, text, SRT, VTT with flexible content options
+- **Advanced Processing**: Batched processing for long audio files
+- **Word-Level Timestamps**: Precise word-level timing information
+- **🆕 Speaker Diarization**: Identify and label different speakers in audio
+- **🆕 Profanity Filtering**: Automatically censor profane language
+- **GPU Acceleration**: CUDA support for faster processing
+- **Multiple Languages**: Auto-detection and manual language specification
+
 ## Installation
 
-### Install faster-whisper
+### Install dependencies
 ```bash
-pip install faster-whisper
+pip install -r requirements.txt
 ```
+
+### Optional: Enhanced Features Setup
+
+#### Speaker Diarization Setup
+To enable speaker diarization, you'll need a Hugging Face token:
+
+1. **Get Hugging Face Token**:
+   - Go to https://huggingface.co/settings/tokens
+   - Create a new token with READ permission
+   - Accept the user conditions at: https://huggingface.co/pyannote/speaker-diarization-3.1
+
+2. **Set Environment Variable**:
+   ```bash
+   # Create .env file
+   echo "HUGGINGFACE_TOKEN=your_token_here" > .env
+   
+   # Or set directly in environment
+   export HUGGINGFACE_TOKEN=your_token_here
+   ```
 
 ### Basic usage
 ```python
@@ -48,8 +78,7 @@ venv\Scripts\activate     # On Windows
 
 3. **Install dependencies:**
 ```bash
-pip install fastapi uvicorn python-multipart faster-whisper
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121  # For CUDA support
+pip install -r requirements.txt
 ```
 
 4. **Start the server:**
@@ -96,6 +125,51 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   --progress-bar
 ```
 
+##### 🆕 Speaker Diarization Examples
+```bash
+# Basic diarization
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "model=whisper-1" \
+  -F "enable_diarization=true" \
+  -F "response_format=json"
+
+# Diarization with speaker constraints
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "model=whisper-1" \
+  -F "enable_diarization=true" \
+  -F "min_speakers=2" \
+  -F "max_speakers=4" \
+  -F "response_format=json"
+
+# SRT format with speaker labels
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "model=whisper-1" \
+  -F "enable_diarization=true" \
+  -F "response_format=srt" \
+  -o subtitles_with_speakers.srt
+```
+
+##### 🆕 Profanity Filtering Examples
+```bash
+# Enable profanity filter
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "model=whisper-1" \
+  -F "enable_profanity_filter=true" \
+  -F "response_format=json"
+
+# Combined features: diarization + profanity filter
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "model=whisper-1" \
+  -F "enable_diarization=true" \
+  -F "enable_profanity_filter=true" \
+  -F "response_format=json"
+```
+
 ##### All Available Options Example
 ```bash
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
@@ -109,6 +183,10 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "temperature=0.1" \
   -F "timestamp_granularities[]=word" \
   -F "output_content=both" \
+  -F "enable_diarization=true" \
+  -F "min_speakers=2" \
+  -F "max_speakers=5" \
+  -F "enable_profanity_filter=true" \
   --progress-bar \
   --connect-timeout 30 \
   --max-time 3600 \
@@ -323,11 +401,17 @@ data = {
     "prompt": "This is a business meeting recording.",
     "response_format": "verbose_json",
     "temperature": 0.1,
-    "timestamp_granularities[]": "word"
+    "timestamp_granularities[]": "word",
+    # New features
+    "enable_diarization": True,
+    "min_speakers": 2,
+    "max_speakers": 4,
+    "enable_profanity_filter": True
 }
 response = requests.post(url, files=files, data=data)
 result = response.json()
 print(result["text"])
+print(f"Speakers found: {result.get('speakers', 'N/A')}")
 ```
 
 #### 4. JavaScript/Node.js (OpenAI Compatible)
@@ -344,11 +428,17 @@ form.append('prompt', 'Business meeting recording');
 form.append('response_format', 'verbose_json');
 form.append('temperature', '0.1');
 form.append('timestamp_granularities[]', 'segment');
+// New features
+form.append('enable_diarization', 'true');
+form.append('min_speakers', '2');
+form.append('max_speakers', '4');
+form.append('enable_profanity_filter', 'true');
 
 axios.post('http://localhost:3333/v1/audio/transcriptions', form, {
   headers: form.getHeaders()
 }).then(response => {
   console.log(response.data.text);
+  console.log(`Speakers found: ${response.data.speakers || 'N/A'}`);
 });
 ```
 
@@ -389,6 +479,10 @@ with open("audio.wav", "rb") as audio_file:
 
 ### Extended Parameters (Not in OpenAI API)
 - **`output_content`**: Fine-grained control - `text_only`, `timestamps_only`, `both`
+- **🆕 `enable_diarization`**: Enable speaker diarization (boolean, default: false)
+- **🆕 `min_speakers`**: Minimum number of speakers (1-20, optional)
+- **🆕 `max_speakers`**: Maximum number of speakers (1-20, optional)
+- **🆕 `enable_profanity_filter`**: Enable profanity filtering (boolean, default: false)
 
 ### Response Formats
 
@@ -397,6 +491,28 @@ with open("audio.wav", "rb") as audio_file:
 {
   "text": "Hello, this is a transcription.",
   "segments": [...]  // or "words": [...] depending on granularity
+}
+```
+
+#### 🆕 `json` with Speaker Diarization
+```json
+{
+  "text": "Hello there. How are you today?",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 2.5,
+      "text": "Hello there.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "start": 2.5,
+      "end": 4.0,
+      "text": "How are you today?",
+      "speaker": "SPEAKER_01"
+    }
+  ],
+  "speakers": 2
 }
 ```
 
@@ -411,25 +527,113 @@ with open("audio.wav", "rb") as audio_file:
 }
 ```
 
+#### 🆕 `verbose_json` with Enhanced Features
+```json
+{
+  "task": "transcribe",
+  "language": "english",
+  "duration": 44.08,
+  "speakers": 2,
+  "text": "Hello there. How are you today?",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 2.5,
+      "text": "Hello there.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "start": 2.5,
+      "end": 4.0,
+      "text": "How are you today?",
+      "speaker": "SPEAKER_01"
+    }
+  ]
+}
+```
+
 #### `text` (Plain Text)
 ```
 Hello, this is a transcription.
 ```
 
-#### `srt` (SubRip Subtitles)
+#### 🆕 `srt` with Speaker Labels
 ```
 1
-00:00:00,000 --> 00:00:03,000
-Hello, this is a transcription.
+00:00:00,000 --> 00:00:02,500
+[SPEAKER_00] Hello there.
+
+2
+00:00:02,500 --> 00:00:04,000
+[SPEAKER_01] How are you today?
 ```
 
-#### `vtt` (WebVTT Subtitles)
+#### 🆕 `vtt` with Speaker Labels
 ```
 WEBVTT
 
-00:00:00.000 --> 00:00:03.000
-Hello, this is a transcription.
+00:00:00.000 --> 00:00:02.500
+[SPEAKER_00] Hello there.
+
+00:00:02.500 --> 00:00:04.000
+[SPEAKER_01] How are you today?
 ```
+
+## 🆕 New Features Guide
+
+### Speaker Diarization
+
+**What it does**: Identifies and labels different speakers in your audio files.
+
+**Requirements**:
+- Hugging Face token (free)
+- ~2GB additional GPU memory
+- Clear audio with distinguishable speakers
+
+**Best Results**:
+- 2-10 speakers
+- Minimal background noise
+- Clear speech separation
+- Audio longer than 30 seconds
+
+**Performance Impact**:
+- Adds 20-50% to processing time
+- GPU acceleration when available
+- Memory usage increases by ~2GB
+
+### Profanity Filtering
+
+**What it does**: Automatically censors profane language in transcriptions.
+
+**Features**:
+- Replaces profane words with asterisks
+- Works with all output formats
+- Minimal performance impact
+- English language focus
+
+**Customization**: The underlying library supports custom word lists for specific use cases.
+
+### Troubleshooting New Features
+
+#### Diarization Issues
+1. **"Pipeline not found" Error**:
+   - Check HUGGINGFACE_TOKEN is set correctly
+   - Verify you've accepted the model license at https://huggingface.co/pyannote/speaker-diarization-3.1
+   - Ensure internet connection for model download
+
+2. **Poor Diarization Results**:
+   - Use `min_speakers`/`max_speakers` to constrain the search
+   - Ensure clear audio with distinct speakers
+   - Try shorter audio segments for better accuracy
+
+3. **Memory Issues**:
+   - Ensure sufficient GPU memory (>2GB free)
+   - Consider processing shorter audio segments
+
+#### Profanity Filter Issues
+- Filter uses a standard English word list
+- May not catch all variations or slang
+- Consider the context of your use case
 
 ### External Access
 
@@ -612,3 +816,4 @@ segments, info = model.transcribe(
     beam_size=5,
     initial_prompt="Transcripción en español.",
 )
+```

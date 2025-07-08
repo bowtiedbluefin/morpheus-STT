@@ -1,8 +1,22 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
-faster-whisper==0.10.0
-torch==2.1.0
-torchaudio==2.1.0
-numpy==1.24.3
-httpx==0.25.2 
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.3.0
+torchvision==0.18.0
+torchaudio==2.3.0
+numpy==1.26.4
+#
+# Main Application Dependencies
+fastapi
+uvicorn
+python-dotenv
+python-multipart
+#
+# Transcription
+ctranslate2==4.3.1
+faster-whisper==1.0.1 
+
+# Diarization
+pyannote.audio>=3.1
+einops 
+
+# Data Handling
+pandas 

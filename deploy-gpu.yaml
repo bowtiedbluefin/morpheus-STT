@@ -16,6 +16,7 @@ services:
           readOnly: false
     env:
       - "PYTHONUNBUFFERED=1"
+      - "HUGGINGFACE_TOKEN=your_token_here"
 
 profiles:
   compute:

@@ -1,36 +1,44 @@
-FROM python:3.11-slim
+# --- Builder Stage ---
+FROM python:3.10-slim as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y build-essential
+
+# Set up working directory
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# --- Final Stage ---
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV HUGGINGFACE_TOKEN=""
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    gcc \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
+    libsndfile1 \
+ && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# Set up working directory and user
 WORKDIR /app
+RUN useradd -m appuser
+USER appuser
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
+# Copy application and dependencies from builder
+COPY --from=builder /app /app
 COPY python_server.py .
-COPY . .
+COPY .env .
 
-# Create models directory for persistent storage
-RUN mkdir -p /app/models
+# Set Hugging Face token from build argument
+ARG HUGGINGFACE_TOKEN
+ENV HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
 
-# Expose the port
+# Expose port and run application
 EXPOSE 3333
-
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV CUDA_VISIBLE_DEVICES=""
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3333/ || exit 1
-
-# Run the application
-CMD ["python", "python_server.py"] 
+CMD ["python3", "python_server.py"] 

@@ -1,352 +1,321 @@
-#https://github.com/SYSTRAN/faster-whisper
-
-from fastapi import FastAPI, UploadFile, File, Form, Query, Request
-from faster_whisper import WhisperModel, BatchedInferencePipeline
-import uvicorn
-import tempfile
+import logging
 import os
+import sys
+import json
+import traceback
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Union
+from datetime import datetime
+import tempfile
+import shutil
+import pandas as pd
+from faster_whisper import WhisperModel
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+import uvicorn
+from dotenv import load_dotenv
 import torch
-from typing import Optional, List, Union
-from enum import Enum
+from pyannote.audio import Pipeline
+from pydantic import BaseModel
 
-app = FastAPI()
+# --- Environment and Logging ---
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Define enums for validation
-class ResponseFormat(str, Enum):
-    json = "json"
-    text = "text"
-    srt = "srt"
-    vtt = "vtt"
-    verbose_json = "verbose_json"
+# --- Configuration ---
+HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
+if not HUGGINGFACE_TOKEN:
+    logger.warning("Hugging Face token not found. Diarization will be disabled.")
 
-class TimestampGranularity(str, Enum):
-    segment = "segment"
-    word = "word"
+# --- Model and Pipeline Initialization ---
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available. This server requires a GPU.")
 
-class OutputContent(str, Enum):
-    text_only = "text_only"
-    timestamps_only = "timestamps_only"
-    both = "both"
+logger.info(f"CUDA available: {torch.cuda.is_available()}")
+logger.info(f"Device: {torch.cuda.get_device_name(0)}")
 
-# Check CUDA availability
-print(f"CUDA available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"CUDA device count: {torch.cuda.device_count()}")
-    print(f"Current CUDA device: {torch.cuda.current_device()}")
-    print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+# Whisper Model
+logger.info("Loading Whisper model (large-v3)...")
+model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+logger.info("Whisper model loaded successfully.")
 
-# Initialize model with explicit CUDA settings
-model = WhisperModel("large-v3", device="cuda", compute_type="float16", download_root="./models")
-# Initialize batched model for long audio processing
-batched_model = BatchedInferencePipeline(model=model)
+# Diarization Pipeline
+diarization_pipeline = None
+if HUGGINGFACE_TOKEN:
+    try:
+        logger.info("Loading Pyannote Diarization pipeline...")
+        diarization_pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=HUGGINGFACE_TOKEN
+        ).to(torch.device("cuda"))
+        logger.info("Diarization pipeline loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load diarization pipeline: {e}")
+        diarization_pipeline = None
 
+app = FastAPI(title="Whisper Transcription API", version="2.0")
+
+# --- Helper Functions ---
+
+def format_timestamp(seconds: float) -> str:
+    dt = datetime.utcfromtimestamp(seconds)
+    return dt.strftime('%H:%M:%S,%f')[:-3]
+
+def to_srt(segments: List[Dict]) -> str:
+    srt_content = ""
+    for i, seg in enumerate(segments):
+        start_time = format_timestamp(seg['start'])
+        end_time = format_timestamp(seg['end'])
+        speaker = f"[{seg['speaker']}] " if 'speaker' in seg else ""
+        srt_content += f"{i + 1}\n{start_time} --> {end_time}\n{speaker}{seg['text'].strip()}\n\n"
+    return srt_content
+
+def to_vtt(segments: List[Dict]) -> str:
+    vtt_content = "WEBVTT\n\n"
+    for seg in segments:
+        start_time = format_timestamp(seg['start']).replace(',', '.')
+        end_time = format_timestamp(seg['end']).replace(',', '.')
+        speaker = f"[{seg['speaker']}] " if 'speaker' in seg else ""
+        vtt_content += f"{start_time} --> {end_time}\n{speaker}{seg['text'].strip()}\n\n"
+    return vtt_content
+
+def transcribe_and_diarize(
+    audio_path: str,
+    language: Optional[str],
+    enable_diarization: bool,
+    min_speakers: Optional[int],
+    max_speakers: Optional[int],
+    # Added parameters
+    beam_size: int,
+    vad_filter: bool,
+    vad_parameters: Dict[str, Any],
+    condition_on_previous_text: bool,
+    temperature: float,
+    prompt: Optional[str]
+) -> (List[Dict], Dict, int):
+    # 1. Transcription with word-level timestamps
+    segments_gen, info = model.transcribe(
+        audio_path,
+        language=language,
+        word_timestamps=True,
+        beam_size=beam_size,
+        vad_filter=vad_filter,
+        vad_parameters=vad_parameters,
+        condition_on_previous_text=condition_on_previous_text,
+        temperature=temperature,
+        initial_prompt=prompt
+    )
+    
+    word_segments = []
+    for segment in segments_gen:
+        for word in segment.words:
+            word_segments.append({
+                "start": word.start, "end": word.end, "text": word.word, "word_prob": word.probability
+            })
+
+    if not enable_diarization or not diarization_pipeline:
+        # Return transcription without diarization
+        final_segments = [{"start": s.start, "end": s.end, "text": s.text} for s in segments_gen]
+        return final_segments, info, 0
+
+    # 2. Speaker Diarization
+    logger.info("Performing speaker diarization...")
+    diarization = diarization_pipeline(audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
+    speaker_turns = pd.DataFrame(
+        [(turn.start, turn.end, speaker) for turn, _, speaker in diarization.itertracks(yield_label=True)],
+        columns=["start", "end", "speaker"]
+    )
+    logger.info(f"Found {len(speaker_turns['speaker'].unique())} speakers.")
+
+    # 3. Align transcription and diarization
+    for word in word_segments:
+        word_center = (word["start"] + word["end"]) / 2
+        speaker = speaker_turns[
+            (speaker_turns["start"] <= word_center) & (speaker_turns["end"] >= word_center)
+        ]
+        if not speaker.empty:
+            word["speaker"] = speaker.iloc[0]["speaker"]
+
+    # 3.5. Fill in UNKNOWN speakers by propagating the last known speaker
+    last_speaker = None
+    for word in word_segments:
+        if 'speaker' in word:
+            last_speaker = word['speaker']
+        elif last_speaker:
+            word['speaker'] = last_speaker
+
+    # 4. Combine words into speaker-aware segments
+    final_segments = []
+    current_segment = None
+    for word in word_segments:
+        if "speaker" not in word:
+            word["speaker"] = "UNKNOWN"
+
+        if current_segment and current_segment["speaker"] == word["speaker"]:
+            current_segment["text"] += " " + word["text"]
+            current_segment["end"] = word["end"]
+        else:
+            if current_segment:
+                final_segments.append(current_segment)
+            current_segment = {
+                "start": word["start"],
+                "end": word["end"],
+                "text": word["text"],
+                "speaker": word["speaker"]
+            }
+    if current_segment:
+        final_segments.append(current_segment)
+
+    num_speakers = len(speaker_turns['speaker'].unique())
+    return final_segments, info, num_speakers
+
+
+# --- API Model ---
+class TranscriptionParams(BaseModel):
+    file: UploadFile
+    language: Optional[str] = None
+    response_format: str = "json"
+    timestamp_granularities: List[str] = ["segment"]
+    enable_diarization: bool = False
+    min_speakers: Optional[int] = None
+    max_speakers: Optional[int] = None
+
+# --- API Endpoints ---
 @app.get("/")
 async def root():
-    return {"message": "Whisper Transcription API", "docs": "Visit /docs for API documentation"}
+    return {"message": "Whisper Transcription API is running."}
 
-@app.get("/transcribe/")
-async def transcribe_info():
-    return {"message": "POST audio files here for transcription", "docs": "Visit /docs to test the API"}
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "gpu_available": torch.cuda.is_available(),
+        "models_loaded": {
+            "transcription": model is not None,
+            "diarization": diarization_pipeline is not None
+        }
+    }
 
-# OpenAI-compatible endpoint with all extended features
 @app.post("/v1/audio/transcriptions")
-async def transcribe_audio(
-    request: Request,
+async def main_transcription_endpoint(
     file: UploadFile = File(...),
-    model_name: str = Form("whisper-1", description="Model to use (ignored, handled by API gateway)"),
-    language: Optional[str] = Form(None, description="Language code (e.g., 'en', 'es', 'fr') or None for auto-detection"),
-    prompt: Optional[str] = Form(None, description="Initial prompt to condition the model"),
-    response_format: ResponseFormat = Form(ResponseFormat.json, description="Output format"),
-    temperature: float = Form(0.0, ge=0.0, le=1.0, description="Sampling temperature (0.0-1.0) - default 0.0 for deterministic output"),
-    output_content: OutputContent = Form(OutputContent.both, description="What to include in JSON response (extended feature)"),
-    use_batched: bool = Form(True, description="Use batched processing for long audio (recommended, default: enabled)"),
-    batch_size: int = Form(8, ge=1, le=64, description="Batch size for batched processing (default: 8 for quality)"),
-    max_speech_duration: float = Form(20.0, ge=5.0, le=120.0, description="Maximum speech segment duration in seconds (default: 20s for quality)")
+    model_name: str = Form("whisper-1"), # Compatibility, not used
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: str = Form("json"),
+    temperature: float = Form(0.0),
+    timestamp_granularities: List[str] = Form(["segment"]), # Compatibility
+    enable_diarization: bool = Form(False),
+    min_speakers: Optional[int] = Form(None),
+    max_speakers: Optional[int] = Form(None),
+    # Restored quality and feature parameters
+    beam_size: int = Form(8, description="Beam size for transcription (higher = more accurate but slower)."),
+    output_content: str = Form("both", description="Control response content: 'text_only', 'timestamps_only', or 'both'."),
+    vad_filter: bool = Form(True, description="Enable Voice Activity Detection (VAD) filter."),
+    vad_threshold: float = Form(0.2, description="VAD threshold for speech detection sensitivity."),
+    min_silence_duration_ms: int = Form(800, description="Minimum silence duration for VAD."),
+    condition_on_previous_text: bool = Form(False, description="Condition on previous text to prevent repetition.")
 ):
-    """OpenAI-compatible transcription endpoint with extended features"""
-    # Parse timestamp_granularities from form data (handles array format timestamp_granularities[])
-    form_data = await request.form()
+    start_time = datetime.now()
     
-    # Handle timestamp_granularities[] array format
-    timestamp_granularities = None
-    for key in form_data.keys():
-        if key.startswith('timestamp_granularities'):
-            if key == 'timestamp_granularities[]':
-                # Array format: timestamp_granularities[]
-                values = form_data.getlist(key)
-                if values:
-                    timestamp_granularities = values[0]  # Use first value for now
-            elif key == 'timestamp_granularities':
-                # Single value format
-                timestamp_granularities = form_data.get(key)
-            break
-    
-    # Default to segment if not provided (OpenAI default behavior)
-    if timestamp_granularities:
-        try:
-            selected_granularity = TimestampGranularity(timestamp_granularities)
-        except ValueError:
-            selected_granularity = TimestampGranularity.segment
-    else:
-        selected_granularity = TimestampGranularity.segment
-    
-    print(f"Starting transcription with params: language={language}, prompt={prompt}, format={response_format}, temp={temperature}, granularity={selected_granularity}, content={output_content}, batched={use_batched}, batch_size={batch_size}")
-    
-    #Save uploaded file temporarily
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    temp_file.write(await file.read())
-    temp_file.close()
-    print(f"Saved temporary file: {temp_file.name}")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided.")
 
-    #Process with Faster-Whisper
-    print("Processing with Whisper...")
-    
-    # Enhanced VAD parameters optimized for quality on long audio
-    enhanced_vad_params = dict(
-        threshold=0.2,                              # More sensitive VAD for better speech detection
-        min_silence_duration_ms=800,                # Shorter silence threshold for better segmentation
-        min_speech_duration_ms=200,                 # Shorter minimum speech for better granularity
-        max_speech_duration_s=max_speech_duration,  # Maximum speech segment (chunking)
-        speech_pad_ms=300                           # Moderate padding around speech
-    )
-    
-    if use_batched:
-        # Use batched processing for long audio
-        segments, info = batched_model.transcribe(
-            temp_file.name,
-            language=language,
-            batch_size=batch_size,
-            beam_size=8,                            # Higher beam size for better quality
-            best_of=8,                              # More candidates for better quality
-            vad_filter=True,
-            vad_parameters=enhanced_vad_params,
-            initial_prompt=prompt,
-            temperature=temperature,
-            condition_on_previous_text=False,       # Prevent repetition in long audio
-            word_timestamps=(selected_granularity == TimestampGranularity.word)
-        )
-    else:
-        # Use standard processing with quality optimizations
-        segments, info = model.transcribe(
-            temp_file.name,
-            language=language,
-            beam_size=8,                            # Higher beam size for better quality
-            best_of=8,                              # More candidates for better quality
-            vad_filter=True,
-            vad_parameters=enhanced_vad_params,
-            initial_prompt=prompt,
-            temperature=temperature,
-            condition_on_previous_text=False,       # Prevent repetition in long audio
-            word_timestamps=(selected_granularity == TimestampGranularity.word)
-        )
-    print("Transcription complete")
+    _, extension = os.path.splitext(file.filename.lower())
+    if extension not in ['.wav', '.mp3', '.flac', '.m4a']:
+        raise HTTPException(status_code=400, detail=f"Unsupported audio format: {extension}")
 
-    #Collect results based on format and granularity
-    if response_format in [ResponseFormat.json, ResponseFormat.verbose_json]:
-        if selected_granularity == TimestampGranularity.word:
-            # Word-level timestamps
-            result = {}
+    temp_audio_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp_file:
+            shutil.copyfileobj(file.file, tmp_file)
+            temp_audio_path = tmp_file.name
+
+        vad_parameters = {
+            "threshold": vad_threshold,
+            "min_silence_duration_ms": min_silence_duration_ms
+        }
+
+        segments, info, num_speakers = transcribe_and_diarize(
+            temp_audio_path, language, enable_diarization, min_speakers, max_speakers,
+            beam_size=beam_size, vad_filter=vad_filter, vad_parameters=vad_parameters,
+            condition_on_previous_text=condition_on_previous_text, temperature=temperature, prompt=prompt
+        )
+
+        full_text = " ".join(s['text'].strip() for s in segments)
+
+        # Format response based on 'response_format'
+        if response_format in ["json", "verbose_json"]:
+            content = {}
+            if response_format == "verbose_json":
+                content.update({
+                    "task": "transcribe",
+                    "language": info.language,
+                    "duration": info.duration,
+                })
+
+            if enable_diarization:
+                content["speakers"] = num_speakers
             
-            # Add verbose metadata if verbose_json format
-            if response_format == ResponseFormat.verbose_json:
-                result["task"] = "transcribe"
-                result["language"] = info.language
-                result["duration"] = info.duration
+            if output_content in ["text_only", "both"]:
+                content["text"] = full_text
+
+            if output_content in ["timestamps_only", "both"]:
+                # For compatibility, return segments, not words, unless specified
+                content["segments"] = segments
+
+            return JSONResponse(content=content)
+
+        elif response_format == "text":
+            return PlainTextResponse(full_text)
+        
+        elif response_format == "srt":
+            return PlainTextResponse(to_srt(segments), media_type="text/plain")
             
-            # Add text if requested
-            if output_content in [OutputContent.text_only, OutputContent.both]:
-                result["text"] = ""
-                for segment in segments:
-                    result["text"] += segment.text + " "
-                result["text"] = result["text"].strip()
-            
-            # Add word timestamps if requested
-            if output_content in [OutputContent.timestamps_only, OutputContent.both]:
-                result["words"] = []
-                # Reset segments iterator
-                if use_batched:
-                    segments, _ = batched_model.transcribe(
-                        temp_file.name,
-                        language=language,
-                        batch_size=batch_size,
-                        beam_size=8,
-                        best_of=8,
-                        vad_filter=True,
-                        vad_parameters=enhanced_vad_params,
-                        initial_prompt=prompt,
-                        temperature=temperature,
-                        condition_on_previous_text=False,       # Prevent repetition in long audio
-                        word_timestamps=True
-                    )
-                else:
-                    segments, _ = model.transcribe(
-                        temp_file.name,
-                        language=language,
-                        beam_size=8,
-                        best_of=8,
-                        vad_filter=True,
-                        vad_parameters=enhanced_vad_params,
-                        initial_prompt=prompt,
-                        temperature=temperature,
-                        condition_on_previous_text=False,       # Prevent repetition in long audio
-                        word_timestamps=True
-                    )
-                
-                for segment in segments:
-                    if hasattr(segment, 'words') and segment.words:
-                        for word in segment.words:
-                            result["words"].append({
-                                "word": word.word,
-                                "start": word.start,
-                                "end": word.end,
-                                "probability": word.probability
-                            })
-                    else:
-                        # Fallback if word timestamps not available
-                        words = segment.text.split()
-                        word_duration = (segment.end - segment.start) / len(words) if words else 0
-                        for i, word in enumerate(words):
-                            result["words"].append({
-                                "word": word,
-                                "start": segment.start + (i * word_duration),
-                                "end": segment.start + ((i + 1) * word_duration),
-                                "probability": None
-                            })
+        elif response_format == "vtt":
+            return PlainTextResponse(to_vtt(segments), media_type="text/plain")
+
         else:
-            # Segment-level timestamps
-            result = {}
-            
-            # Add verbose metadata if verbose_json format
-            if response_format == ResponseFormat.verbose_json:
-                result["task"] = "transcribe"
-                result["language"] = info.language
-                result["duration"] = info.duration
-            
-            # Add text if requested
-            if output_content in [OutputContent.text_only, OutputContent.both]:
-                result["text"] = ""
-                for segment in segments:
-                    result["text"] += segment.text + " "
-                result["text"] = result["text"].strip()
-            
-            # Add segment timestamps if requested
-            if output_content in [OutputContent.timestamps_only, OutputContent.both]:
-                result["segments"] = []
-                # Reset segments iterator if we already consumed it
-                if output_content == OutputContent.timestamps_only:
-                    if use_batched:
-                        segments, _ = batched_model.transcribe(
-                            temp_file.name,
-                            language=language,
-                            batch_size=batch_size,
-                            beam_size=8,                            # Higher beam size for better quality
-                            best_of=8,                              # More candidates for better quality
-                            vad_filter=True,
-                            vad_parameters=enhanced_vad_params,
-                            initial_prompt=prompt,
-                            temperature=temperature,
-                            condition_on_previous_text=False,       # Prevent repetition in long audio
-                            word_timestamps=False
-                        )
-                    else:
-                        segments, _ = model.transcribe(
-                            temp_file.name,
-                            language=language,
-                            beam_size=8,                            # Higher beam size for better quality
-                            best_of=8,                              # More candidates for better quality
-                            vad_filter=True,
-                            vad_parameters=enhanced_vad_params,
-                            initial_prompt=prompt,
-                            temperature=temperature,
-                            condition_on_previous_text=False,       # Prevent repetition in long audio
-                            word_timestamps=False
-                        )
-                
-                for segment in segments:
-                    result["segments"].append({
-                        "start": segment.start,
-                        "end": segment.end,
-                        "text": segment.text
-                    })
-    
-    elif response_format == ResponseFormat.text:
-        # Plain text format
-        result = ""
-        for segment in segments:
-            result += segment.text + " "
-        result = result.strip()
-    
-    elif response_format == ResponseFormat.srt:
-        # SRT subtitle format
-        result = ""
-        for i, segment in enumerate(segments, 1):
-            start_time = format_timestamp_srt(segment.start)
-            end_time = format_timestamp_srt(segment.end)
-            result += f"{i}\n{start_time} --> {end_time}\n{segment.text.strip()}\n\n"
-    
-    elif response_format == ResponseFormat.vtt:
-        # WebVTT format
-        result = "WEBVTT\n\n"
-        for segment in segments:
-            start_time = format_timestamp_vtt(segment.start)
-            end_time = format_timestamp_vtt(segment.end)
-            result += f"{start_time} --> {end_time}\n{segment.text.strip()}\n\n"
-    
-    #Clean up
-    os.unlink(temp_file.name)
-    
-    # Return appropriate content type
-    if response_format in [ResponseFormat.json, ResponseFormat.verbose_json]:
-        return result
-    else:
-        from fastapi.responses import PlainTextResponse
-        return PlainTextResponse(content=result, media_type="text/plain")
+            raise HTTPException(status_code=400, detail="Invalid response_format")
 
-# Alias endpoint for backward compatibility and convenience
-@app.post("/transcribe/")
-async def transcribe_audio_alias(
-    request: Request,
+    except Exception as e:
+        logger.error(f"Error during transcription: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            os.remove(temp_audio_path)
+        torch.cuda.empty_cache()
+
+# Alias for backwards compatibility
+@app.post("/transcribe")
+async def transcribe_alias(
     file: UploadFile = File(...),
-    model_name: str = Form("whisper-1", description="Model to use (ignored, handled by API gateway)"),
-    language: Optional[str] = Form(None, description="Language code (e.g., 'en', 'es', 'fr') or None for auto-detection"),
-    prompt: Optional[str] = Form(None, description="Initial prompt to condition the model"),
-    response_format: ResponseFormat = Form(ResponseFormat.json, description="Output format"),
-    temperature: float = Form(0.0, ge=0.0, le=1.0, description="Sampling temperature (0.0-1.0) - default 0.0 for deterministic output"),
-    output_content: OutputContent = Form(OutputContent.both, description="What to include in JSON response (extended feature)"),
-    use_batched: bool = Form(True, description="Use batched processing for long audio (recommended, default: enabled)"),
-    batch_size: int = Form(8, ge=1, le=64, description="Batch size for batched processing (default: 8 for quality)"),
-    max_speech_duration: float = Form(20.0, ge=5.0, le=120.0, description="Maximum speech segment duration in seconds (default: 20s for quality)")
+    language: Optional[str] = Form(None),
+    response_format: str = Form("json"),
+    enable_diarization: bool = Form(False),
+    min_speakers: Optional[int] = Form(None),
+    max_speakers: Optional[int] = Form(None)
 ):
-    """Alias to the main transcription endpoint - same functionality"""
-    return await transcribe_audio(
-        request=request,
+    return await main_transcription_endpoint(
         file=file,
-        model_name=model_name,
+        model_name="whisper-1",
         language=language,
-        prompt=prompt,
+        prompt=None,
         response_format=response_format,
-        temperature=temperature,
-        output_content=output_content,
-        use_batched=use_batched,
-        batch_size=batch_size,
-        max_speech_duration=max_speech_duration
+        temperature=0.0,
+        timestamp_granularities=["segment"],
+        enable_diarization=enable_diarization,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        # Pass defaults for restored params
+        beam_size=8,
+        output_content="both",
+        vad_filter=True,
+        vad_threshold=0.2,
+        min_silence_duration_ms=800,
+        condition_on_previous_text=False
     )
-
-def format_timestamp_srt(seconds):
-    """Format timestamp for SRT format (HH:MM:SS,mmm)"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millisecs = int((seconds % 1) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
-
-def format_timestamp_vtt(seconds):
-    """Format timestamp for VTT format (HH:MM:SS.mmm)"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millisecs = int((seconds % 1) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millisecs:03d}"
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3333)
