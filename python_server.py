@@ -106,9 +106,12 @@ def transcribe_and_diarize(
         temperature=temperature,
         initial_prompt=prompt
     )
-    
+
+        # Materialize the generator immediately to allow multiple iterations
+    materialized_segments = list(segments_gen)
+
     word_segments = []
-    for segment in segments_gen:
+    for segment in materialized_segments:
         for word in segment.words:
             word_segments.append({
                 "start": word.start, "end": word.end, "text": word.word, "word_prob": word.probability
@@ -116,7 +119,7 @@ def transcribe_and_diarize(
 
     if not enable_diarization or not diarization_pipeline:
         # Return transcription without diarization
-        final_segments = [{"start": s.start, "end": s.end, "text": s.text} for s in segments_gen]
+        final_segments = [{"start": s.start, "end": s.end, "text": s.text} for s in materialized_segments]
         return final_segments, info, 0
 
     # 2. Speaker Diarization

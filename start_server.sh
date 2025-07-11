@@ -28,4 +28,4 @@ echo "Starting Enhanced Whisper API Server..."
 echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 
 # Start the server
-python python_server.py 
+uvicorn python_server:app --host 0.0.0.0 --port 3333 
