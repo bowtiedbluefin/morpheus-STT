@@ -15,14 +15,11 @@ Simple guide to deploy your Whisper Transcription API on the Akash Network using
 
 ## Step 1: Build and Push Docker Image
 
-The `HUGGINGFACE_TOKEN` is required to build the image successfully.
+The `HUGGINGFACE_TOKEN` is not required to build the image. It will be provided at runtime.
 
 ```bash
-# Provide your Hugging Face token as a build argument
-# Replace 'your_token_here' and 'yourusername'
-docker build \
-  --build-arg HUGGINGFACE_TOKEN="your_token_here" \
-  -t yourusername/whisper-transcription-api:latest .
+# Replace 'yourusername' with your Docker Hub username
+docker build -t yourusername/whisper-transcription-api:latest .
 
 # Push to Docker Hub (this will take time)
 docker push yourusername/whisper-transcription-api:latest
