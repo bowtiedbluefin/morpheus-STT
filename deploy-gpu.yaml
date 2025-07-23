@@ -9,14 +9,17 @@ services:
         as: 80
         to:
           - global: true
+        http_options:
+          max_body_size: 4294967295
+          read_timeout: 300000
     params:
       storage:
         models:
           mount: /app/models
           readOnly: false
     env:
-      - "PYTHONUNBUFFERED=1"
-      - "HUGGINGFACE_TOKEN=your_token_here"
+      - PYTHONUNBUFFERED=1
+      - HUGGINGFACE_TOKEN=your_token_here
 
 profiles:
   compute:
