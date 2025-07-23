@@ -11,7 +11,13 @@ services:
           - global: true
         http_options:
           max_body_size: 4294967295
-          read_timeout: 300000
+          read_timeout: 3600000 # 1 hour
+          send_timeout: 60000
+          next_cases:
+            - error
+            - timeout
+          next_tries: 3
+          next_timeout: 60000
     params:
       storage:
         models:

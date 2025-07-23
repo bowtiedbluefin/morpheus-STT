@@ -11,12 +11,14 @@ import shutil
 import pandas as pd
 from faster_whisper import WhisperModel
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 import uvicorn
 from dotenv import load_dotenv
 import torch
 from pyannote.audio import Pipeline
 from pydantic import BaseModel
+import subprocess
 
 # --- Environment and Logging ---
 load_dotenv()
@@ -93,7 +95,7 @@ def transcribe_and_diarize(
     condition_on_previous_text: bool,
     temperature: float,
     prompt: Optional[str]
-) -> (List[Dict], Dict, int):
+) -> (List[Dict], Dict, int, List[Dict]):
     # 1. Transcription with word-level timestamps
     segments_gen, info = model.transcribe(
         audio_path,
@@ -112,19 +114,27 @@ def transcribe_and_diarize(
 
     word_segments = []
     for segment in materialized_segments:
-        for word in segment.words:
-            word_segments.append({
-                "start": word.start, "end": word.end, "text": word.word, "word_prob": word.probability
-            })
+        if segment.words:
+            for word in segment.words:
+                word_segments.append({
+                    "start": word.start, "end": word.end, "text": word.word, "word_prob": word.probability
+                })
 
     if not enable_diarization or not diarization_pipeline:
         # Return transcription without diarization
         final_segments = [{"start": s.start, "end": s.end, "text": s.text} for s in materialized_segments]
-        return final_segments, info, 0
+        return final_segments, info, 0, word_segments
 
     # 2. Speaker Diarization
     logger.info("Performing speaker diarization...")
-    diarization = diarization_pipeline(audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
+    
+    diarization_params = {}
+    if min_speakers is not None:
+        diarization_params["min_speakers"] = min_speakers
+    if max_speakers is not None:
+        diarization_params["max_speakers"] = max_speakers
+
+    diarization = diarization_pipeline(audio_path, **diarization_params)
     speaker_turns = pd.DataFrame(
         [(turn.start, turn.end, speaker) for turn, _, speaker in diarization.itertracks(yield_label=True)],
         columns=["start", "end", "speaker"]
@@ -171,7 +181,7 @@ def transcribe_and_diarize(
         final_segments.append(current_segment)
 
     num_speakers = len(speaker_turns['speaker'].unique())
-    return final_segments, info, num_speakers
+    return final_segments, info, num_speakers, word_segments
 
 
 # --- API Model ---
@@ -210,8 +220,8 @@ async def main_transcription_endpoint(
     temperature: float = Form(0.0),
     timestamp_granularities: List[str] = Form(["segment"]), # Compatibility
     enable_diarization: bool = Form(False),
-    min_speakers: Optional[int] = Form(None),
-    max_speakers: Optional[int] = Form(None),
+    min_speakers: Optional[str] = Form(None),
+    max_speakers: Optional[str] = Form(None),
     # Restored quality and feature parameters
     beam_size: int = Form(8, description="Beam size for transcription (higher = more accurate but slower)."),
     output_content: str = Form("both", description="Control response content: 'text_only', 'timestamps_only', or 'both'."),
@@ -229,21 +239,46 @@ async def main_transcription_endpoint(
     if extension not in ['.wav', '.mp3', '.flac', '.m4a']:
         raise HTTPException(status_code=400, detail=f"Unsupported audio format: {extension}")
 
+    min_speakers_int = int(min_speakers) if min_speakers and min_speakers.isdigit() else None
+    max_speakers_int = int(max_speakers) if max_speakers and max_speakers.isdigit() else None
+
     temp_audio_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp_file:
             shutil.copyfileobj(file.file, tmp_file)
             temp_audio_path = tmp_file.name
 
+        # The audio is converted to a standardized format to avoid issues with pyannote
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as converted_file:
+            converted_audio_path = converted_file.name
+
+        command = ["ffmpeg", "-i", temp_audio_path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", converted_audio_path]
+        
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg conversion failed: {e.stderr}")
+            raise HTTPException(status_code=500, detail=f"Audio processing failed: {e.stderr}")
+        
+
         vad_parameters = {
             "threshold": vad_threshold,
             "min_silence_duration_ms": min_silence_duration_ms
         }
 
-        segments, info, num_speakers = transcribe_and_diarize(
-            temp_audio_path, language, enable_diarization, min_speakers, max_speakers,
-            beam_size=beam_size, vad_filter=vad_filter, vad_parameters=vad_parameters,
-            condition_on_previous_text=condition_on_previous_text, temperature=temperature, prompt=prompt
+        segments, info, num_speakers, words = await run_in_threadpool(
+            transcribe_and_diarize,
+            audio_path=converted_audio_path,
+            language=language,
+            enable_diarization=enable_diarization,
+            min_speakers=min_speakers_int,
+            max_speakers=max_speakers_int,
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            vad_parameters=vad_parameters,
+            condition_on_previous_text=condition_on_previous_text,
+            temperature=temperature,
+            prompt=prompt
         )
 
         full_text = " ".join(s['text'].strip() for s in segments)
@@ -266,7 +301,11 @@ async def main_transcription_endpoint(
 
             if output_content in ["timestamps_only", "both"]:
                 # For compatibility, return segments, not words, unless specified
-                content["segments"] = segments
+                if "word" in timestamp_granularities:
+                    content["words"] = words
+                if "segment" in timestamp_granularities or "words" not in content:
+                    content["segments"] = segments
+
 
             return JSONResponse(content=content)
 
@@ -288,6 +327,8 @@ async def main_transcription_endpoint(
     finally:
         if temp_audio_path and os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
+        if 'converted_audio_path' in locals() and os.path.exists(converted_audio_path):
+            os.remove(converted_audio_path)
         torch.cuda.empty_cache()
 
 # Alias for backwards compatibility
@@ -297,9 +338,10 @@ async def transcribe_alias(
     language: Optional[str] = Form(None),
     response_format: str = Form("json"),
     enable_diarization: bool = Form(False),
-    min_speakers: Optional[int] = Form(None),
-    max_speakers: Optional[int] = Form(None)
+    min_speakers: Optional[str] = Form(None),
+    max_speakers: Optional[str] = Form(None)
 ):
+    # This alias maintains backward compatibility but uses the full-featured endpoint internally.
     return await main_transcription_endpoint(
         file=file,
         model_name="whisper-1",
@@ -311,7 +353,6 @@ async def transcribe_alias(
         enable_diarization=enable_diarization,
         min_speakers=min_speakers,
         max_speakers=max_speakers,
-        # Pass defaults for restored params
         beam_size=8,
         output_content="both",
         vad_filter=True,
