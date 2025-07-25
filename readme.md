@@ -478,11 +478,16 @@ with open("audio.wav", "rb") as audio_file:
 - **`timestamp_granularities[]`**: Array or single value - `segment`, `word`
 
 ### Extended Parameters (Not in OpenAI API)
-- **`output_content`**: Fine-grained control - `text_only`, `timestamps_only`, `both`
-- **🆕 `enable_diarization`**: Enable speaker diarization (boolean, default: false)
-- **🆕 `min_speakers`**: Minimum number of speakers (1-20, optional)
-- **🆕 `max_speakers`**: Maximum number of speakers (1-20, optional)
-- **🆕 `enable_profanity_filter`**: Enable profanity filtering (boolean, default: false)
+- **`output_content`**: Control response content: `text_only`, `timestamps_only`, or `both` (string, default: 'both').
+- **`beam_size`**: Beam size for transcription (integer, default: 8). Higher values are more accurate but slower.
+- **`vad_filter`**: Enable Voice Activity Detection (VAD) to filter out non-speech sections (boolean, default: True).
+- **`vad_threshold`**: VAD threshold for speech detection sensitivity (float, default: 0.2).
+- **`min_silence_duration_ms`**: Minimum silence duration for VAD (integer, default: 800).
+- **`condition_on_previous_text`**: Condition on previous text to prevent repetition issues (boolean, default: False).
+- **`enable_profanity_filter`**: Enable the profanity filter to censor words (boolean, default: False).
+- **`enable_diarization`**: Enable speaker diarization to identify who is speaking (boolean, default: False).
+- **`min_speakers`**: Minimum number of speakers to detect for diarization (integer, optional).
+- **`max_speakers`**: Maximum number of speakers to detect for diarization (integer, optional).
 
 ### Response Formats
 
@@ -603,15 +608,16 @@ WEBVTT
 
 ### Profanity Filtering
 
-**What it does**: Automatically censors profane language in transcriptions.
+**What it does**: Automatically censors profane language in transcriptions by suppressing the model's default list of profanities.
 
 **Features**:
-- Replaces profane words with asterisks
-- Works with all output formats
-- Minimal performance impact
-- English language focus
+- Replaces profane words with appropriate substitutions (e.g., asterisks).
+- Works with all output formats (`json`, `text`, `srt`, `vtt`).
+- Has minimal impact on performance.
+- Primarily focused on English, but may work for other languages.
 
-**Customization**: The underlying library supports custom word lists for specific use cases.
+**How it Works**:
+When enabled, the API uses the `suppress_tokens=[-1]` parameter in the underlying `faster-whisper` library. This special value instructs the model to use its built-in list of profane tokens and avoid generating them.
 
 ### Troubleshooting New Features
 

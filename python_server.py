@@ -94,22 +94,26 @@ def transcribe_and_diarize(
     vad_parameters: Dict[str, Any],
     condition_on_previous_text: bool,
     temperature: float,
-    prompt: Optional[str]
+    prompt: Optional[str],
+    enable_profanity_filter: bool
 ) -> (List[Dict], Dict, int, List[Dict]):
     # 1. Transcription with word-level timestamps
-    segments_gen, info = model.transcribe(
-        audio_path,
-        language=language,
-        word_timestamps=True,
-        beam_size=beam_size,
-        vad_filter=vad_filter,
-        vad_parameters=vad_parameters,
-        condition_on_previous_text=condition_on_previous_text,
-        temperature=temperature,
-        initial_prompt=prompt
-    )
+    transcribe_args = {
+        "language": language,
+        "word_timestamps": True,
+        "beam_size": beam_size,
+        "vad_filter": vad_filter,
+        "vad_parameters": vad_parameters,
+        "condition_on_previous_text": condition_on_previous_text,
+        "temperature": temperature,
+        "initial_prompt": prompt
+    }
+    if enable_profanity_filter:
+        transcribe_args["suppress_tokens"] = [-1]
 
-        # Materialize the generator immediately to allow multiple iterations
+    segments_gen, info = model.transcribe(audio_path, **transcribe_args)
+
+    # Materialize the generator immediately to allow multiple iterations
     materialized_segments = list(segments_gen)
 
     word_segments = []
@@ -184,16 +188,6 @@ def transcribe_and_diarize(
     return final_segments, info, num_speakers, word_segments
 
 
-# --- API Model ---
-class TranscriptionParams(BaseModel):
-    file: UploadFile
-    language: Optional[str] = None
-    response_format: str = "json"
-    timestamp_granularities: List[str] = ["segment"]
-    enable_diarization: bool = False
-    min_speakers: Optional[int] = None
-    max_speakers: Optional[int] = None
-
 # --- API Endpoints ---
 @app.get("/")
 async def root():
@@ -228,7 +222,8 @@ async def main_transcription_endpoint(
     vad_filter: bool = Form(True, description="Enable Voice Activity Detection (VAD) filter."),
     vad_threshold: float = Form(0.2, description="VAD threshold for speech detection sensitivity."),
     min_silence_duration_ms: int = Form(800, description="Minimum silence duration for VAD."),
-    condition_on_previous_text: bool = Form(False, description="Condition on previous text to prevent repetition.")
+    condition_on_previous_text: bool = Form(False, description="Condition on previous text to prevent repetition."),
+    enable_profanity_filter: bool = Form(False, description="Enable the profanity filter to censorResults.")
 ):
     start_time = datetime.now()
     
@@ -241,6 +236,10 @@ async def main_transcription_endpoint(
 
     min_speakers_int = int(min_speakers) if min_speakers and min_speakers.isdigit() else None
     max_speakers_int = int(max_speakers) if max_speakers and max_speakers.isdigit() else None
+
+    # Treat empty string for language as None to trigger automatic language detection
+    if not language:
+        language = None
 
     temp_audio_path = None
     try:
@@ -278,7 +277,8 @@ async def main_transcription_endpoint(
             vad_parameters=vad_parameters,
             condition_on_previous_text=condition_on_previous_text,
             temperature=temperature,
-            prompt=prompt
+            prompt=prompt,
+            enable_profanity_filter=enable_profanity_filter
         )
 
         full_text = " ".join(s['text'].strip() for s in segments)
@@ -335,30 +335,48 @@ async def main_transcription_endpoint(
 @app.post("/transcribe")
 async def transcribe_alias(
     file: UploadFile = File(...),
+    model_name: str = Form("whisper-1"),
     language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
     response_format: str = Form("json"),
+    temperature: float = Form(0.0),
+    timestamp_granularities: List[str] = Form(["segment"]),
     enable_diarization: bool = Form(False),
     min_speakers: Optional[str] = Form(None),
-    max_speakers: Optional[str] = Form(None)
+    max_speakers: Optional[str] = Form(None),
+    beam_size: int = Form(8),
+    output_content: str = Form("both"),
+    vad_filter: bool = Form(True),
+    vad_threshold: float = Form(0.2),
+    min_silence_duration_ms: int = Form(800),
+    condition_on_previous_text: bool = Form(False),
+    enable_profanity_filter: bool = Form(False)
 ):
-    # This alias maintains backward compatibility but uses the full-featured endpoint internally.
+    # This alias maintains backward compatibility by simply calling the new endpoint.
+    # It now accepts all the same parameters as the main endpoint for full functionality.
+
+    # Treat empty string for language as None to trigger automatic language detection
+    if not language:
+        language = None
+        
     return await main_transcription_endpoint(
         file=file,
-        model_name="whisper-1",
+        model_name=model_name,
         language=language,
-        prompt=None,
+        prompt=prompt,
         response_format=response_format,
-        temperature=0.0,
-        timestamp_granularities=["segment"],
+        temperature=temperature,
+        timestamp_granularities=timestamp_granularities,
         enable_diarization=enable_diarization,
         min_speakers=min_speakers,
         max_speakers=max_speakers,
-        beam_size=8,
-        output_content="both",
-        vad_filter=True,
-        vad_threshold=0.2,
-        min_silence_duration_ms=800,
-        condition_on_previous_text=False
+        beam_size=beam_size,
+        output_content=output_content,
+        vad_filter=vad_filter,
+        vad_threshold=vad_threshold,
+        min_silence_duration_ms=min_silence_duration_ms,
+        condition_on_previous_text=condition_on_previous_text,
+        enable_profanity_filter=enable_profanity_filter
     )
 
 if __name__ == "__main__":
