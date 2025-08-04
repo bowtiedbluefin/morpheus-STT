@@ -3,7 +3,7 @@ version: "2.0"
 
 services:
   whisper-api:
-    image: your-dockerhub-username/whisper-transcription-api:latest
+    image: kylecohen01/whisper-transcription-api:1.4
     expose:
       - port: 3333
         as: 80
@@ -11,13 +11,13 @@ services:
           - global: true
         http_options:
           max_body_size: 4294967295
-          read_timeout: 3600000 # 1 hour
-          send_timeout: 60000
+          read_timeout: 3600000
+          send_timeout: 600000
           next_cases:
             - error
             - timeout
           next_tries: 3
-          next_timeout: 60000
+          next_timeout: 600000
     params:
       storage:
         models:
@@ -26,6 +26,19 @@ services:
     env:
       - PYTHONUNBUFFERED=1
       - HUGGINGFACE_TOKEN=your_token_here
+      - WHISPERX_COMPUTE_TYPE=float32
+      - WHISPERX_BATCH_SIZE=8
+      - WHISPERX_CHAR_ALIGN=true
+      - MAX_CONCURRENT_REQUESTS=4
+      - MEMORY_PER_REQUEST_GB=6.0
+      - WHISPERX_CHUNK_LENGTH=15
+      - VAD_ONSET=0.500
+      - VAD_OFFSET=0.200
+      - ALIGN_MODEL=WAV2VEC2_ASR_LARGE_LV60K_960H
+      - INTERPOLATE_METHOD=linear
+      - SEGMENT_RESOLUTION=sentence
+      - ENABLE_REQUEST_QUEUING=true
+      - QUEUE_TIMEOUT=300
 
 profiles:
   compute:
@@ -41,13 +54,11 @@ profiles:
             vendor:
               nvidia:
                 - model: rtx4090
-                - model: rtx4080
                 - model: rtx3090
-                - model: rtx3080
                 - model: a6000
                 - model: v100
         storage:
-          - size: 30Gi
+          - size: 50Gi
             name: models
   placement:
     dcloud:
