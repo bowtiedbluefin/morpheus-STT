@@ -3,7 +3,7 @@ version: "2.0"
 
 services:
   whisper-api:
-    image: your-dockerhub-username/whisper-transcription-api:latest
+    image: kylecohen01/whisper-transcription-api:1.4
     expose:
       - port: 3333
         as: 80

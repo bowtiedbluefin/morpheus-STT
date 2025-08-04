@@ -11,7 +11,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir --prefix="/install" whisperx psutil fastapi uvicorn python-multipart
 
 # --- Final Stage ---  
-FROM nvidia/cuda:12.4-cudnn9-runtime-ubuntu22.04
+FROM nvidia/cuda:12.6.2-runtime-ubuntu22.04
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
