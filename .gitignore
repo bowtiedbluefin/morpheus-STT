@@ -117,6 +117,13 @@ Thumbs.db
 # *.m4a
 # *.ogg
 
+# Test audio files and directories
+Morpheus*
+*Morpheus*
+*.mp3
+*.wav
+*.json
+
 # Output files
 *.srt
 *.vtt

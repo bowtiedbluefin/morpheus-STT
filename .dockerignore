@@ -9,6 +9,12 @@ models/
 *.pyd
 .env
 *test*
+*Test*
+Morpheus*
+*Morpheus*
+*.mp3
+*.wav
+*.json
 readme.md
 deploy.yaml
 deploy-gpu.yaml
