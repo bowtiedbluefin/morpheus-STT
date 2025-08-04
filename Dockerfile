@@ -1,5 +1,5 @@
 # --- Builder Stage ---
-FROM python:3.12-slim AS builder
+FROM python:3.10-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y build-essential
@@ -16,10 +16,10 @@ FROM nvidia/cuda:12.6.2-runtime-ubuntu22.04
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH="/install/lib/python3.12/site-packages"
+ENV PYTHONPATH="/install/lib/python3.10/site-packages"
 
 # CRITICAL: PyTorch CUDA library isolation to fix cuDNN version conflicts
-ENV LD_LIBRARY_PATH="/install/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/install/lib/python3.12/site-packages/nvidia/cudnn/lib:/install/lib/python3.12/site-packages/nvidia/cublas/lib:/install/lib/python3.12/site-packages/nvidia/cufft/lib:/install/lib/python3.12/site-packages/nvidia/curand/lib:/install/lib/python3.12/site-packages/nvidia/cusolver/lib:/install/lib/python3.12/site-packages/nvidia/cusparse/lib"
+ENV LD_LIBRARY_PATH="/install/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:/install/lib/python3.10/site-packages/nvidia/cudnn/lib:/install/lib/python3.10/site-packages/nvidia/cublas/lib:/install/lib/python3.10/site-packages/nvidia/cufft/lib:/install/lib/python3.10/site-packages/nvidia/curand/lib:/install/lib/python3.10/site-packages/nvidia/cusolver/lib:/install/lib/python3.10/site-packages/nvidia/cusparse/lib"
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
