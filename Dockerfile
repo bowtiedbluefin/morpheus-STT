@@ -1,14 +1,18 @@
 # --- Builder Stage ---
-FROM python:3.10-slim AS builder
+FROM python:3.12-slim AS builder
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y build-essential
+RUN apt-get update && apt-get install -y build-essential git
 
 # Set up working directory
 WORKDIR /app
 
-# Install Python dependencies - use official WhisperX installation
-RUN pip install --no-cache-dir --prefix="/install" whisperx psutil fastapi uvicorn python-multipart
+# Copy requirements file and create filtered version
+COPY requirements.txt .
+
+# Remove problematic packages and CUDA 11 libraries, keep only CUDA 12
+RUN grep -v "profanity" requirements.txt | grep -v "cu11" > requirements_filtered.txt && \
+    pip install --no-cache-dir --prefix="/install" -r requirements_filtered.txt
 
 # --- Final Stage ---  
 FROM nvidia/cuda:12.6.2-runtime-ubuntu22.04
@@ -16,16 +20,22 @@ FROM nvidia/cuda:12.6.2-runtime-ubuntu22.04
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH="/install/lib/python3.10/site-packages"
+ENV PYTHONPATH="/install/lib/python3.12/site-packages"
 
 # CRITICAL: PyTorch CUDA library isolation to fix cuDNN version conflicts
-ENV LD_LIBRARY_PATH="/install/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:/install/lib/python3.10/site-packages/nvidia/cudnn/lib:/install/lib/python3.10/site-packages/nvidia/cublas/lib:/install/lib/python3.10/site-packages/nvidia/cufft/lib:/install/lib/python3.10/site-packages/nvidia/curand/lib:/install/lib/python3.10/site-packages/nvidia/cusolver/lib:/install/lib/python3.10/site-packages/nvidia/cusparse/lib"
+ENV LD_LIBRARY_PATH="/install/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/install/lib/python3.12/site-packages/nvidia/cudnn/lib:/install/lib/python3.12/site-packages/nvidia/cublas/lib:/install/lib/python3.12/site-packages/nvidia/cufft/lib:/install/lib/python3.12/site-packages/nvidia/curand/lib:/install/lib/python3.12/site-packages/nvidia/cusolver/lib:/install/lib/python3.12/site-packages/nvidia/cusparse/lib"
 
-# Install system dependencies
+# Install system dependencies including Python 3.12
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
 RUN apt-get update && apt-get install -y \
-    python3 \
+    software-properties-common \
     ffmpeg \
     libsndfile1 \
+ && add-apt-repository ppa:deadsnakes/ppa \
+ && apt-get update \
+ && apt-get install -y python3.12 python3.12-dev python3.12-venv \
+ && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
  && rm -rf /var/lib/apt/lists/*
 
 # WhisperX Optimization 
