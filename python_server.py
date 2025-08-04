@@ -8,10 +8,13 @@ from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 import tempfile
 import shutil
+
 import whisperx
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from contextlib import asynccontextmanager
 import uvicorn
 from dotenv import load_dotenv
 import torch
@@ -116,29 +119,42 @@ logger.info("WhisperX model loaded successfully.")
 if not HUGGINGFACE_TOKEN:
     logger.warning("Hugging Face token not found. Diarization will be disabled.")
 
-app = FastAPI(
-    title="WhisperX Transcription API", 
-    version="2.0",
-    description="OpenAI-compatible transcription API using WhisperX large-v3 model with concurrent processing"
-)
-
 # Background tasks
 background_tasks = set()
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize background monitoring tasks"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan - startup and shutdown"""
+    # Startup
     task = asyncio.create_task(monitor_memory())
     background_tasks.add(task)
     task.add_done_callback(background_tasks.discard)
     logger.info(f"Started concurrent processing with max {CONCURRENT_CONFIG['max_concurrent_requests']} requests")
-
-@app.on_event("shutdown") 
-async def shutdown_event():
-    """Clean up background tasks"""
+    
+    yield  # Application runs here
+    
+    # Shutdown
     for task in background_tasks:
         task.cancel()
     logger.info("Shutdown complete")
+
+app = FastAPI(
+    title="WhisperX Transcription API", 
+    version="2.0",
+    description="OpenAI-compatible transcription API using WhisperX large-v3 model with concurrent processing",
+    lifespan=lifespan
+)
+
+# Add CORS middleware to allow browser requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for Swagger UI and browser requests
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
+
+# Event handlers are now handled by the lifespan context manager above
 
 # --- Helper Functions ---
 
@@ -572,4 +588,10 @@ async def get_processing_status():
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=3333)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=3333,
+        timeout_keep_alive=0,  # No timeout - keep connection alive as long as needed
+        # Note: File size limits are handled by the deployment config (max_body_size: 4294967295 ≈ 4GB)
+    )

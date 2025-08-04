@@ -7,15 +7,17 @@ RUN apt-get update && apt-get install -y build-essential git
 # Set up working directory
 WORKDIR /app
 
-# Copy requirements file and create filtered version
+# Copy requirements and install with minimal filtering
 COPY requirements.txt .
-
-# Remove problematic packages and CUDA 11 libraries, keep only CUDA 12
-RUN grep -v "profanity" requirements.txt | grep -v "cu11" > requirements_filtered.txt && \
+RUN pip install --no-cache-dir --prefix="/install" psutil && \
+    pip install --no-cache-dir --prefix="/install" torch==2.6.0+cu126 torchaudio==2.6.0+cu126 torchvision==0.21.0+cu126 --index-url https://download.pytorch.org/whl/cu126 && \
+    pip install --no-cache-dir --prefix="/install" ctranslate2==4.4.0 && \
+    pip install --no-cache-dir --prefix="/install" whisperx==3.4.2 && \
+    grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" > requirements_filtered.txt && \
     pip install --no-cache-dir --prefix="/install" -r requirements_filtered.txt
 
 # --- Final Stage ---  
-FROM nvidia/cuda:12.6.2-runtime-ubuntu22.04
+FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
