@@ -2,16 +2,16 @@
 
 ## Features
 
-- **🆕 WhisperX Integration**: Enhanced transcription with improved accuracy and speed
+- **WhisperX Integration**: Enhanced transcription with improved accuracy and speed
 - **OpenAI-Compatible API**: Drop-in replacement for OpenAI's Whisper API
 - **Multiple Output Formats**: JSON, text, SRT, VTT with flexible content options
 - **Word-Level Timestamps**: Precise word-level timing with confidence scores
-- **🆕 Built-in Speaker Diarization**: Identify and label different speakers automatically
+- **Speaker Diarization**: Identify and label different speakers automatically
 - **Legacy Compatibility**: Supports OpenAI API parameters for easy migration
 - **GPU Acceleration**: CUDA support for faster processing
 - **Multiple Languages**: Auto-detection and manual language specification
 
-## What's New with WhisperX
+## Improvements with WhisperX
 
 WhisperX provides significant improvements over standard Whisper:
 - **Better Accuracy**: Enhanced transcription quality
@@ -104,7 +104,7 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@/path/to/your/audio/file.wav"
 ```
 
-##### 🆕 Speaker Diarization Examples
+##### Speaker Diarization Examples
 ```bash
 # Basic diarization
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
@@ -128,7 +128,7 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -o subtitles_with_speakers.srt
 ```
 
-##### 🆕 Advanced Features Examples
+##### Advanced Features Examples
 ```bash
 # Multiple timestamp granularities
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
@@ -393,7 +393,7 @@ with open("audio.wav", "rb") as audio_file:
 Hello, this is a transcription.
 ```
 
-#### 🆕 `srt` with Speaker Labels
+#### `srt` with Speaker Labels
 ```
 1
 00:00:00,000 --> 00:00:02,500
@@ -404,7 +404,7 @@ Hello, this is a transcription.
 [SPEAKER_01] How are you today?
 ```
 
-#### 🆕 `vtt` with Speaker Labels
+#### `vtt` with Speaker Labels
 ```
 WEBVTT
 
@@ -414,28 +414,6 @@ WEBVTT
 00:00:02.500 --> 00:00:04.000
 [SPEAKER_01] How are you today?
 ```
-
-## WhisperX Features Guide
-
-### Speaker Diarization
-
-**What it does**: Identifies and labels different speakers in your audio files using advanced neural networks.
-
-**Requirements**:
-- Hugging Face token (free)
-- ~2GB additional GPU memory
-- Clear audio with distinguishable speakers
-
-**Best Results**:
-- 2-10 speakers
-- Minimal background noise
-- Clear speech separation
-- Audio longer than 30 seconds
-
-**Performance Impact**:
-- Adds 20-50% to processing time
-- GPU acceleration when available
-- Memory usage increases by ~2GB
 
 ### Output Control
 
@@ -505,13 +483,13 @@ export WHISPERX_BATCH_SIZE=16
 export MAX_CONCURRENT_REQUESTS=15
 ```
 
-📋 **See [config_examples.env](config_examples.env) for complete configuration profiles**
+**See [config_examples.env](config_examples.env) for complete configuration profiles**
 
-**📖 For comprehensive optimization guidance, see [WHISPERX_OPTIMIZATION_GUIDE.md](WHISPERX_OPTIMIZATION_GUIDE.md)**
+**For comprehensive optimization guidance, see [WHISPERX_OPTIMIZATION_GUIDE.md](WHISPERX_OPTIMIZATION_GUIDE.md)**
 
-**🚀 For concurrent processing & GPU optimization, see [CONCURRENT_PROCESSING_GUIDE.md](CONCURRENT_PROCESSING_GUIDE.md)**
+**For concurrent processing & GPU optimization, see [CONCURRENT_PROCESSING_GUIDE.md](CONCURRENT_PROCESSING_GUIDE.md)**
 
-**🐳 For Docker deployment updates, see [DEPLOYMENT_UPDATES.md](DEPLOYMENT_UPDATES.md)**
+**For Docker deployment updates, see [DEPLOYMENT_UPDATES.md](DEPLOYMENT_UPDATES.md)**
 
 ### What's Different from faster-whisper:
 - **Temperature, beam_size, condition_on_previous_text**: Now handled internally for better defaults

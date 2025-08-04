@@ -2,14 +2,6 @@
 
 ## Overview
 
-WhisperX abstracts away many of the manual optimization parameters you used with faster-whisper in favor of a more automated, internally-optimized approach. However, there are still important optimization levers available for fine-tuning performance.
-
-## Key Philosophy Change
-
-### faster-whisper Approach (Manual):
-- Direct control over temperature, beam_size, VAD thresholds
-- Manual parameter tuning required for each audio type
-- Complex parameter interactions to manage
 
 ### WhisperX Approach (Automated):
 - Built-in VAD preprocessing

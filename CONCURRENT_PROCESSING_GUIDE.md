@@ -123,53 +123,6 @@ curl http://localhost:3333/processing-status
 curl http://localhost:3333/health
 ```
 
-## Addressing Customer Feedback Issues
-
-### 1. Punctuation Issues ✅ **SOLVED**
-**WhisperX Advantages:**
-- Phoneme-based alignment provides better punctuation context
-- Character-level alignments capture punctuation accurately
-- `float32` + `char_align=true` maximizes punctuation quality
-
-**Settings:**
-```bash
-export WHISPERX_COMPUTE_TYPE=float32
-export WHISPERX_CHAR_ALIGN=true
-export SEGMENT_RESOLUTION=sentence
-```
-
-### 2. Speaker Count Issues ⚠️ **NEEDS TUNING** 
-**Current Issue:** Over-detection observed (10minutes_2speakers.mp3 → detected 3 speakers)
-
-**WhisperX Advantages:**
-- Better integrated diarization with tighter VAD control
-- More sensitive onset/offset detection (can be tuned)
-- Cleaner speaker boundary detection
-
-**Recommended Tuning for Over-Detection:**
-```bash
-export VAD_ONSET=0.500      # Less sensitive (increased from 0.400)
-export VAD_OFFSET=0.200     # Tighter boundaries (decreased from 0.300)
-# ALWAYS use min_speakers/max_speakers in API calls to constrain detection
-```
-
-**API Usage:**
-```bash
-curl -F "min_speakers=2" -F "max_speakers=2" ...  # Force exact speaker count
-```
-
-### 3. Speaker Turn Issues ✅ **IMPROVED**
-**WhisperX Advantages:**
-- Shorter chunk processing for better boundaries
-- Linear interpolation for smoother word timing
-- Integrated alignment eliminates manual overlap logic
-
-**Settings:**
-```bash
-export WHISPERX_CHUNK_LENGTH=15
-export INTERPOLATE_METHOD=linear
-```
-
 ## Production Deployment Strategies
 
 ### Option 1: RTX 3090 (Current)
