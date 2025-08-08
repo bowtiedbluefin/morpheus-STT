@@ -75,15 +75,25 @@ Common language codes:
     {
       "start": 0.0,
       "end": 2.5,
-      "text": "Hello, this is a transcription.",
-      "words": [
-        {
-          "word": "Hello",
-          "start": 0.0,
-          "end": 0.5,
-          "score": 0.95
-        }
-      ]
+      "text": "Hello, this is a transcription."
+    }
+  ],
+  "words": [
+    {
+      "start": 0.0,
+      "end": 0.5,
+      "text": "Hello",
+      "decorated_text": "Hello",
+      "word_prob": 0.95,
+      "speaker": null
+    },
+    {
+      "start": 0.5,
+      "end": 1.2,
+      "text": "this",
+      "decorated_text": "this", 
+      "word_prob": 0.98,
+      "speaker": null
     }
   ]
 }
@@ -98,18 +108,42 @@ Common language codes:
       "start": 0.0,
       "end": 2.5,
       "text": "Hello there.",
-      "speaker": "SPEAKER_00",
-      "words": [...]
+      "speaker": "SPEAKER_00"
     },
     {
       "start": 2.5,
       "end": 4.0,
       "text": "How are you today?",
-      "speaker": "SPEAKER_01",
-      "words": [...]
+      "speaker": "SPEAKER_01"
     }
   ],
-  "speakers": 2
+  "speakers": 2,
+  "words": [
+    {
+      "start": 0.0,
+      "end": 0.5,
+      "text": "Hello",
+      "decorated_text": "Hello",
+      "word_prob": 0.95,
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "start": 0.6,
+      "end": 1.1,
+      "text": "there.",
+      "decorated_text": "there.",
+      "word_prob": 0.92,
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "start": 2.5,
+      "end": 2.8,
+      "text": "How",
+      "decorated_text": "How",
+      "word_prob": 0.98,
+      "speaker": "SPEAKER_01"
+    }
+  ]
 }
 ```
 

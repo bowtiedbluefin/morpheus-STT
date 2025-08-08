@@ -149,3 +149,5 @@ watchfiles==1.1.0
 websockets==15.0.1
 whisperx @ git+https://github.com/m-bain/whisperX.git@2d9ce44329ae73af2520196d31cd14b6192ace44
 yarl==1.20.1
+nemo-text-processing
+contractions

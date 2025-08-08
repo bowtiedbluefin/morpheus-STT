@@ -20,4 +20,5 @@ deploy.yaml
 deploy-gpu.yaml
 akash-ui-deployment-guide.md
 start_server.sh
-test_audio.wav 
+test_audio.wav
+performance_analysis*.md 

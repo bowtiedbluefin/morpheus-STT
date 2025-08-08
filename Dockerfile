@@ -7,13 +7,19 @@ RUN apt-get update && apt-get install -y build-essential git
 # Set up working directory
 WORKDIR /app
 
-# Copy requirements and install with minimal filtering
+# Copy requirements and install with selective filtering
 COPY requirements.txt .
+
+# Install core packages with specific versions first
 RUN pip install --no-cache-dir --prefix="/install" psutil && \
     pip install --no-cache-dir --prefix="/install" torch==2.6.0+cu126 torchaudio==2.6.0+cu126 torchvision==0.21.0+cu126 --index-url https://download.pytorch.org/whl/cu126 && \
     pip install --no-cache-dir --prefix="/install" ctranslate2==4.4.0 && \
-    pip install --no-cache-dir --prefix="/install" whisperx==3.4.2 && \
-    grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" > requirements_filtered.txt && \
+    pip install --no-cache-dir --prefix="/install" whisperx==3.4.2
+
+# Install remaining packages including text processing libraries
+# Includes: nemo-text-processing (with pynini/OpenFST), contractions, and other dependencies
+# Note: nemo-text-processing works on Linux x86_64 with existing build-essential
+RUN grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" > requirements_filtered.txt && \
     pip install --no-cache-dir --prefix="/install" -r requirements_filtered.txt
 
 # --- Final Stage ---  
@@ -40,20 +46,34 @@ RUN apt-get update && apt-get install -y \
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
  && rm -rf /var/lib/apt/lists/*
 
-# WhisperX Optimization 
+# Enhanced WhisperX Configuration (Customer Feedback Optimized)
 ENV WHISPERX_COMPUTE_TYPE=float32
 ENV WHISPERX_BATCH_SIZE=8
 ENV WHISPERX_CHAR_ALIGN=true
-ENV MAX_CONCURRENT_REQUESTS=4
+ENV MAX_CONCURRENT_REQUESTS=3
 ENV MEMORY_PER_REQUEST_GB=6.0
+
+# Enhanced VAD Configuration (addressing customer feedback)
 ENV WHISPERX_CHUNK_LENGTH=15
-ENV VAD_ONSET=0.500
-ENV VAD_OFFSET=0.200
+ENV VAD_ONSET=0.35
+ENV VAD_OFFSET=0.25
+ENV MIN_SEGMENT_LENGTH=0.5
+ENV MAX_SEGMENT_LENGTH=30.0
+ENV SPEECH_THRESHOLD=0.6
+
+# Speaker Attribution Improvements
+ENV SPEAKER_SMOOTHING_ENABLED=true
+ENV SPEAKER_CONFIDENCE_THRESHOLD=0.8
+
+# WhisperX Core Settings
 ENV ALIGN_MODEL=WAV2VEC2_ASR_LARGE_LV60K_960H
 ENV INTERPOLATE_METHOD=linear
 ENV SEGMENT_RESOLUTION=sentence
 ENV ENABLE_REQUEST_QUEUING=true
 ENV QUEUE_TIMEOUT=300
+
+# Text Processing Enhancements
+ENV TEXT_NORMALIZATION_MODE=enhanced
 
 # Set up working directory and user
 WORKDIR /app

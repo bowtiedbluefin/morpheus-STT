@@ -128,4 +128,7 @@ Morpheus*
 *.srt
 *.vtt
 transcription*.json
-transcription*.txt 
+transcription*.txt
+
+# Performance analysis files
+performance_analysis*.md 

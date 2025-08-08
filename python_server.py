@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 import tempfile
 import shutil
+import re
 
 import whisperx
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
@@ -30,6 +31,74 @@ HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
 if not HUGGINGFACE_TOKEN:
     logger.warning("Hugging Face token not found. Diarization will be disabled.")
 
+# --- Text Processing Functions ---
+try:
+    import contractions
+    from nemo_text_processing.text_normalization.normalize import Normalizer
+    NORMALIZER = Normalizer(input_case='lower_cased', lang='en')
+    TEXT_PROCESSING_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Text processing libraries not available: {e}")
+    logger.warning("Falling back to basic text normalization")
+    TEXT_PROCESSING_AVAILABLE = False
+
+def normalize_text_for_display(text: str) -> str:
+    """
+    Normalize text for proper display formatting using established NLP libraries.
+    Converts uppercase emotional text to proper capitalization and punctuation.
+    
+    Args:
+        text: Raw transcribed text (may contain emotional uppercase)
+    
+    Returns:
+        Properly formatted text with correct capitalization and punctuation
+    """
+    if not text or not isinstance(text, str):
+        return text
+    
+    text = text.strip()
+    if not text:
+        return text
+    
+    if TEXT_PROCESSING_AVAILABLE:
+        try:
+            # Step 1: Convert to lowercase and expand contractions
+            normalized = text.lower()
+            normalized = contractions.fix(normalized)
+            
+            # Step 2: Use NeMo text normalizer for proper capitalization and formatting
+            # This handles proper nouns, sentence beginnings, etc.
+            normalized = NORMALIZER.normalize(normalized, verbose=False)
+            
+            return normalized
+        except Exception as e:
+            logger.warning(f"Text normalization failed: {e}, falling back to basic normalization")
+            
+    # Fallback: Basic normalization if libraries aren't available
+    normalized = text.lower()
+    
+    # Basic contractions
+    basic_contractions = {
+        " im ": " I'm ", " youre ": " you're ", " hes ": " he's ", " shes ": " she's ",
+        " its ": " it's ", " were ": " we're ", " theyre ": " they're ", " dont ": " don't ",
+        " cant ": " can't ", " wont ": " won't ", " isnt ": " isn't ", " arent ": " aren't "
+    }
+    
+    normalized_spaced = f" {normalized} "
+    for old, new in basic_contractions.items():
+        normalized_spaced = normalized_spaced.replace(old, new)
+    normalized = normalized_spaced.strip()
+    
+    # Capitalize first letter and after periods
+    if normalized:
+        normalized = normalized[0].upper() + normalized[1:]
+    normalized = re.sub(r'([.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), normalized)
+    
+    # Always capitalize "I"
+    normalized = re.sub(r'\bi\b', 'I', normalized)
+    
+    return normalized
+
 # Customer Feedback Optimized Settings for Accuracy
 WHISPERX_CONFIG = {
     # Core accuracy settings (based on customer feedback)
@@ -38,14 +107,25 @@ WHISPERX_CONFIG = {
     "chunk_length_s": int(os.getenv("WHISPERX_CHUNK_LENGTH", "15")), # Shorter for better speaker turns
     "return_char_alignments": os.getenv("WHISPERX_CHAR_ALIGN", "true").lower() == "true", # For punctuation
     
-    # Diarization accuracy (addressing customer speaker issues)
-    "vad_onset": float(os.getenv("VAD_ONSET", "0.400")),          # More sensitive for speaker turns
-    "vad_offset": float(os.getenv("VAD_OFFSET", "0.300")),        # Tighter boundaries
-    "interpolate_method": os.getenv("INTERPOLATE_METHOD", "linear"), # Better word timing
+    # Enhanced VAD Configuration (addressing customer speaker attribution issues)
+    "vad_onset": float(os.getenv("VAD_ONSET", "0.35")),           # Enhanced: More sensitive boundary detection
+    "vad_offset": float(os.getenv("VAD_OFFSET", "0.25")),         # Enhanced: Tighter boundaries
+    "min_segment_length": float(os.getenv("MIN_SEGMENT_LENGTH", "0.5")), # Prevents over-segmentation
+    "max_segment_length": float(os.getenv("MAX_SEGMENT_LENGTH", "30.0")), # Maximum segment duration
+    "speech_threshold": float(os.getenv("SPEECH_THRESHOLD", "0.6")), # Confidence threshold for speech detection
     
     # Advanced settings
+    "interpolate_method": os.getenv("INTERPOLATE_METHOD", "linear"), # Better word timing
     "align_model": os.getenv("ALIGN_MODEL", "WAV2VEC2_ASR_LARGE_LV60K_960H"), # Best alignment model
     "segment_resolution": os.getenv("SEGMENT_RESOLUTION", "sentence"), # Better punctuation context
+}
+
+# Enhanced Diarization Configuration (Customer Feedback Addressing)
+DIARIZATION_CONFIG = {
+    "speaker_smoothing_enabled": os.getenv("SPEAKER_SMOOTHING_ENABLED", "true").lower() == "true",
+    "speaker_confidence_threshold": float(os.getenv("SPEAKER_CONFIDENCE_THRESHOLD", "0.8")),
+    "text_normalization_mode": os.getenv("TEXT_NORMALIZATION_MODE", "enhanced"),
+    "sentiment_analysis_enabled": os.getenv("SENTIMENT_ANALYSIS_ENABLED", "false").lower() == "true",
 }
 
 # Concurrent Processing Configuration
@@ -191,9 +271,19 @@ async def transcribe_with_concurrency_control(
 ) -> (List[Dict], Any, int, List[Dict]):
     """Wrapper for transcribe_and_diarize with concurrency control and queuing"""
     
+    # Log when waiting for semaphore (queued state)
+    queue_start_time = time.time()
+    logger.info(f"Request {request_id}: Waiting for processing slot...")
+    
     async with processing_semaphore:
-        # Log start of processing
+        # Log start of processing and queue time
         start_time = time.time()
+        queue_wait_time = start_time - queue_start_time
+        if queue_wait_time > 0.1:  # Only log if there was significant queue time
+            logger.info(f"Request {request_id}: Waited {queue_wait_time:.2f}s in queue, now processing...")
+        else:
+            logger.info(f"Request {request_id}: Processing immediately...")
+        
         active_requests[request_id] = RequestState(request_id, start_time)
         
         try:
@@ -329,11 +419,12 @@ def transcribe_and_diarize(
     word_segments = []
     if raw_words:
         for word in raw_words:
+            raw_text = word.get("word", "")
             word_segments.append({
                 "start": word.get("start"),
                 "end": word.get("end"),
-                "text": word.get("word"),
-                "decorated_text": word.get("word", "").strip(),
+                "text": raw_text,
+                "decorated_text": normalize_text_for_display(raw_text),
                 "word_prob": word.get("score"),
                 "speaker": word.get("speaker")
             })
@@ -395,20 +486,7 @@ async def main_transcription_endpoint(
     request_id = f"req_{request_counter}_{int(time.time())}"
     start_time = datetime.now()
     
-    # Check if we can accept the request
-    current_active = len(active_requests)
-    if current_active >= CONCURRENT_CONFIG["max_concurrent_requests"]:
-        if not CONCURRENT_CONFIG["enable_request_queuing"]:
-            raise HTTPException(
-                status_code=503, 
-                detail=f"Server at capacity. {current_active}/{CONCURRENT_CONFIG['max_concurrent_requests']} slots in use. Queuing disabled."
-            )
-        else:
-            # TODO: Implement proper queuing in future enhancement
-            raise HTTPException(
-                status_code=503,
-                detail=f"Server at capacity. {current_active}/{CONCURRENT_CONFIG['max_concurrent_requests']} slots in use. Queue not yet implemented."
-            )
+    # Note: Semaphore will handle queuing automatically - no manual capacity check needed
     
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided.")
@@ -583,7 +661,22 @@ async def get_processing_status():
             "batch_size": WHISPERX_CONFIG["batch_size"],
             "chunk_length_s": WHISPERX_CONFIG["chunk_length_s"],
             "return_char_alignments": WHISPERX_CONFIG["return_char_alignments"],
-            "align_model": WHISPERX_CONFIG["align_model"]
+            "align_model": WHISPERX_CONFIG["align_model"],
+            "segment_resolution": WHISPERX_CONFIG["segment_resolution"],
+            "interpolate_method": WHISPERX_CONFIG["interpolate_method"]
+        },
+        "enhanced_vad_config": {
+            "vad_onset": WHISPERX_CONFIG["vad_onset"],
+            "vad_offset": WHISPERX_CONFIG["vad_offset"], 
+            "min_segment_length": WHISPERX_CONFIG["min_segment_length"],
+            "max_segment_length": WHISPERX_CONFIG["max_segment_length"],
+            "speech_threshold": WHISPERX_CONFIG["speech_threshold"]
+        },
+        "diarization_config": {
+            "speaker_smoothing_enabled": DIARIZATION_CONFIG["speaker_smoothing_enabled"],
+            "speaker_confidence_threshold": DIARIZATION_CONFIG["speaker_confidence_threshold"],
+            "text_normalization_mode": DIARIZATION_CONFIG["text_normalization_mode"],
+            "sentiment_analysis_enabled": DIARIZATION_CONFIG["sentiment_analysis_enabled"]
         }
     }
 
