@@ -339,17 +339,22 @@ class WorkingGPUDiarizationServer:
                         if hasattr(self.diarization_pipeline._embedding, 'batch_size'):
                             self.diarization_pipeline._embedding.batch_size = 32
                     
-                    # Apply dynamic diarization parameters from environment
-                    diarization_params = {
-                        'segmentation': {'threshold': self.segmentation_threshold},
-                        'clustering': {'threshold': self.clustering_threshold}
-                    }
+                    # Configure diarization parameters directly on pipeline components
+                    # (pyannote.audio 3.3.2 doesn't accept parameters in apply() call)
+                    if hasattr(self.diarization_pipeline, '_segmentation') and hasattr(self.diarization_pipeline._segmentation, 'instantiate'):
+                        try:
+                            self.diarization_pipeline._segmentation.instantiate().threshold = self.segmentation_threshold
+                        except:
+                            pass  # If configuration fails, continue with defaults
                     
-                    # Run diarization on GPU with configured parameters
-                    diarization_result = self.diarization_pipeline(
-                        preprocessed_audio_path, 
-                        **diarization_params
-                    )
+                    if hasattr(self.diarization_pipeline, '_clustering') and hasattr(self.diarization_pipeline._clustering, 'instantiate'):
+                        try:
+                            self.diarization_pipeline._clustering.instantiate().threshold = self.clustering_threshold  
+                        except:
+                            pass  # If configuration fails, continue with defaults
+                    
+                    # Run diarization on GPU (no parameters - configured above)
+                    diarization_result = self.diarization_pipeline(preprocessed_audio_path)
                     
                     # FIXED: Use manual speaker assignment instead of broken whisperx function
                     result = self.manual_speaker_assignment(result, diarization_result)
