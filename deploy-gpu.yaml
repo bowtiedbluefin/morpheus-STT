@@ -26,6 +26,17 @@ services:
     env:
       - PYTHONUNBUFFERED=1
       - HUGGINGFACE_TOKEN=your_token_here
+      
+      # Advanced Diarization Configuration
+      - PYANNOTE_CLUSTERING_THRESHOLD=0.7
+      - PYANNOTE_SEGMENTATION_THRESHOLD=0.45
+      - SPEAKER_CONFIDENCE_THRESHOLD=0.6
+      - MIN_SPEAKER_DURATION=3.0
+      - SPEAKER_SMOOTHING_ENABLED=true
+      - MIN_SWITCH_DURATION=2.0
+      - VAD_VALIDATION_ENABLED=false
+      
+      # Core WhisperX Configuration
       - WHISPERX_COMPUTE_TYPE=float32
       - WHISPERX_BATCH_SIZE=8
       - WHISPERX_CHAR_ALIGN=true

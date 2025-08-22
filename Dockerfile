@@ -16,10 +16,13 @@ RUN pip install --no-cache-dir --prefix="/install" psutil && \
     pip install --no-cache-dir --prefix="/install" ctranslate2==4.4.0 && \
     pip install --no-cache-dir --prefix="/install" whisperx==3.4.2
 
+# Install diarization dependencies (pyannote.audio and related packages)
+RUN pip install --no-cache-dir --prefix="/install" pyannote.audio==3.3.2 speechbrain==0.5.16
+
 # Install remaining packages including text processing libraries
 # Includes: nemo-text-processing (with pynini/OpenFST), contractions, and other dependencies
 # Note: nemo-text-processing works on Linux x86_64 with existing build-essential
-RUN grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" > requirements_filtered.txt && \
+RUN grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" | grep -v "pyannote.audio" | grep -v "speechbrain" > requirements_filtered.txt && \
     pip install --no-cache-dir --prefix="/install" -r requirements_filtered.txt
 
 # --- Final Stage ---  
@@ -53,17 +56,22 @@ ENV WHISPERX_CHAR_ALIGN=true
 ENV MAX_CONCURRENT_REQUESTS=3
 ENV MEMORY_PER_REQUEST_GB=6.0
 
-# Enhanced VAD Configuration (addressing customer feedback)
+# Advanced Diarization Configuration (Optimized System)
+ENV PYANNOTE_CLUSTERING_THRESHOLD=0.7
+ENV PYANNOTE_SEGMENTATION_THRESHOLD=0.45
+ENV SPEAKER_CONFIDENCE_THRESHOLD=0.6
+ENV MIN_SPEAKER_DURATION=3.0
+ENV SPEAKER_SMOOTHING_ENABLED=true
+ENV MIN_SWITCH_DURATION=2.0
+ENV VAD_VALIDATION_ENABLED=false
+
+# Enhanced VAD Configuration (legacy compatibility)
 ENV WHISPERX_CHUNK_LENGTH=15
 ENV VAD_ONSET=0.35
 ENV VAD_OFFSET=0.25
 ENV MIN_SEGMENT_LENGTH=0.5
 ENV MAX_SEGMENT_LENGTH=30.0
 ENV SPEECH_THRESHOLD=0.6
-
-# Speaker Attribution Improvements
-ENV SPEAKER_SMOOTHING_ENABLED=true
-ENV SPEAKER_CONFIDENCE_THRESHOLD=0.8
 
 # WhisperX Core Settings
 ENV ALIGN_MODEL=WAV2VEC2_ASR_LARGE_LV60K_960H
@@ -83,8 +91,12 @@ USER appuser
 # Copy application and dependencies from builder
 COPY --from=builder /install /install
 COPY python_server.py .
-COPY config_examples.env .
+COPY env.example .
+COPY start_server.sh .
+
+# Make startup script executable and expose port
+RUN chmod +x start_server.sh
 
 # Expose port and run application
 EXPOSE 3333
-CMD ["python3", "python_server.py"] 
+CMD ["./start_server.sh"] 
