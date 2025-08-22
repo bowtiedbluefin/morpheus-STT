@@ -40,6 +40,23 @@ import torch
 load_dotenv()
 load_dotenv("working_gpu.env")  # Load specific config for working GPU server
 
+def convert_numpy_types(obj):
+    """Convert numpy types to JSON-serializable Python types recursively"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_numpy_types(item) for item in obj)
+    else:
+        return obj
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -144,7 +161,7 @@ class WorkingGPUDiarizationServer:
             logger.error(traceback.format_exc())
             raise
 
-    def manual_speaker_assignment(self, transcription_result: dict, diarization_result) -> dict:
+    def manual_speaker_assignment(self, transcription_result: dict, diarization_result, speaker_confidence_threshold: float = 0.6) -> dict:
         """
         FIXED: Manual speaker assignment that bypasses broken whisperx.assign_word_speakers
         This prevents the KeyError: 'e' issue
@@ -194,12 +211,12 @@ class WorkingGPUDiarizationServer:
                             confidence = segment_confidences.get(spk_seg['segment_id'], 0.5)
                             
                             # CRITICAL FIX: Apply speaker confidence threshold (SR-TH)
-                            if confidence >= self.speaker_confidence_threshold:
+                            if confidence >= speaker_confidence_threshold:
                                 max_overlap = overlap
                                 best_speaker = spk_seg['speaker']
                                 best_confidence = confidence
                             else:
-                                logger.debug(f"Rejected speaker assignment due to low confidence: {confidence:.3f} < {self.speaker_confidence_threshold}")
+                                logger.debug(f"Rejected speaker assignment due to low confidence: {confidence:.3f} < {speaker_confidence_threshold}")
                     
                     # Assign speaker (default to SPEAKER_00 if no confident match)
                     word['speaker'] = best_speaker if best_speaker else "SPEAKER_00"
@@ -211,7 +228,7 @@ class WorkingGPUDiarizationServer:
                     # Use majority speaker for segment, but only count high-confidence assignments
                     confident_speakers = []
                     for w in segment['words']:
-                        if 'speaker' in w and w.get('speaker_confidence', 0) >= self.speaker_confidence_threshold:
+                        if 'speaker' in w and w.get('speaker_confidence', 0) >= speaker_confidence_threshold:
                             confident_speakers.append(w['speaker'])
                     
                     if confident_speakers:
@@ -230,11 +247,11 @@ class WorkingGPUDiarizationServer:
             # Count unique speakers (only confident ones)
             confident_speakers = set()
             for segment in transcription_result['segments']:
-                if 'speaker' in segment and segment.get('speaker_confidence', 0) >= self.speaker_confidence_threshold:
+                if 'speaker' in segment and segment.get('speaker_confidence', 0) >= speaker_confidence_threshold:
                     confident_speakers.add(segment['speaker'])
             
             logger.info(f"✅ Manual speaker assignment complete - {len(confident_speakers)} confident speakers detected")
-            logger.info(f"   Speaker confidence threshold: {self.speaker_confidence_threshold}")
+            logger.info(f"   Speaker confidence threshold: {speaker_confidence_threshold}")
             return transcription_result
             
         except Exception as e:
@@ -242,7 +259,7 @@ class WorkingGPUDiarizationServer:
             logger.error(traceback.format_exc())
             return transcription_result
 
-    def filter_spurious_speakers(self, result: dict) -> dict:
+    def filter_spurious_speakers(self, result: dict, min_speaker_duration: float = 3.0, speaker_confidence_threshold: float = 0.6) -> dict:
         """
         Remove speakers with less than minimum speaking time
         ENHANCED: Now uses confidence-based filtering and multiple criteria
@@ -295,7 +312,7 @@ class WorkingGPUDiarizationServer:
                 reasons = []
                 
                 # Criterion 1: Duration too short (with adaptive threshold)
-                adaptive_min_duration = self.min_speaker_duration * duration_multiplier
+                adaptive_min_duration = min_speaker_duration * duration_multiplier
                 if stats['total_duration'] < adaptive_min_duration:
                     is_spurious = True
                     reasons.append(f"duration {stats['total_duration']:.1f}s < {adaptive_min_duration:.1f}s (adaptive)")
@@ -304,11 +321,11 @@ class WorkingGPUDiarizationServer:
                 # Instead of absolute 0.6/0.7, use relative to other speakers
                 all_confidences = [stats['avg_confidence'] for stats in speaker_stats.values()]
                 if len(all_confidences) > 1:
-                    base_threshold = min(self.speaker_confidence_threshold, 
+                    base_threshold = min(speaker_confidence_threshold, 
                                        max(all_confidences) * 0.75)  # 75% of highest confidence
                     confidence_threshold = base_threshold * confidence_multiplier
                 else:
-                    confidence_threshold = self.speaker_confidence_threshold * 0.8 * confidence_multiplier  # More lenient for single speaker
+                    confidence_threshold = speaker_confidence_threshold * 0.8 * confidence_multiplier  # More lenient for single speaker
                     
                 if stats['avg_confidence'] < confidence_threshold:
                     is_spurious = True
@@ -371,13 +388,13 @@ class WorkingGPUDiarizationServer:
             logger.error(traceback.format_exc())
             return result
 
-    def smooth_speaker_changes(self, result: dict) -> dict:
+    def smooth_speaker_changes(self, result: dict, speaker_smoothing_enabled: bool = True, min_switch_duration: float = 2.0) -> dict:
         """
         OPTIMIZATION 1: Speaker Smoothing
         Reduces rapid speaker A → B → A switches that are likely errors
         """
         try:
-            if not self.speaker_smoothing_enabled:
+            if not speaker_smoothing_enabled:
                 return result
                 
             segments = result.get('segments', [])
@@ -405,7 +422,7 @@ class WorkingGPUDiarizationServer:
                     # Check if middle segment is too short
                     current_duration = current_segment.get('end', 0) - current_segment.get('start', 0)
                     
-                    if current_duration < self.min_switch_duration:
+                    if current_duration < min_switch_duration:
                         # Check confidence levels
                         prev_conf = prev_segment.get('speaker_confidence', 0.5)
                         current_conf = current_segment.get('speaker_confidence', 0.5)
@@ -665,7 +682,25 @@ class WorkingGPUDiarizationServer:
             # Return original path if preprocessing fails
             return audio_path
 
-    async def transcribe_with_diarization(self, audio_path: str, enable_diarization: bool = True) -> dict:
+    async def transcribe_with_diarization(
+        self, 
+        audio_path: str, 
+        enable_diarization: bool = True,
+        language: str = "en",
+        model: str = "large-v2", 
+        batch_size: int = 8,
+        prompt: str = "",
+        temperature: float = 0.0,
+        timestamp_granularities: str = "segment",
+        output_content: str = "both",
+        clustering_threshold: float = 0.7,
+        segmentation_threshold: float = 0.45,
+        min_speaker_duration: float = 3.0,
+        speaker_confidence_threshold: float = 0.6,
+        speaker_smoothing_enabled: bool = True,
+        min_switch_duration: float = 2.0,
+        vad_validation_enabled: bool = False
+    ) -> dict:
         """
         WORKING transcription with diarization - all issues FIXED
         """
@@ -684,10 +719,22 @@ class WorkingGPUDiarizationServer:
                 initial_memory = torch.cuda.memory_allocated() / 1e6  # MB
                 logger.info(f"GPU memory before transcription: {initial_memory:.1f} MB")
             
+            # Build transcription options
+            transcribe_options = {
+                "batch_size": batch_size,
+                "language": language
+            }
+            
+            # Add optional parameters if provided
+            if prompt and prompt.strip():
+                transcribe_options["initial_prompt"] = prompt.strip()
+            
+            if temperature > 0:
+                transcribe_options["temperature"] = temperature
+            
             result = self.transcription_model.transcribe(
                 audio_path,
-                batch_size=self.batch_size,
-                language="en"
+                **transcribe_options
             )
             transcribe_time = time.time() - start_time
             logger.info(f"Transcription completed in {transcribe_time:.1f}s")
@@ -742,13 +789,13 @@ class WorkingGPUDiarizationServer:
                     # (pyannote.audio 3.3.2 doesn't accept parameters in apply() call)
                     if hasattr(self.diarization_pipeline, '_segmentation') and hasattr(self.diarization_pipeline._segmentation, 'instantiate'):
                         try:
-                            self.diarization_pipeline._segmentation.instantiate().threshold = self.segmentation_threshold
+                            self.diarization_pipeline._segmentation.instantiate().threshold = segmentation_threshold
                         except:
                             pass  # If configuration fails, continue with defaults
                     
                     if hasattr(self.diarization_pipeline, '_clustering') and hasattr(self.diarization_pipeline._clustering, 'instantiate'):
                         try:
-                            self.diarization_pipeline._clustering.instantiate().threshold = self.clustering_threshold  
+                            self.diarization_pipeline._clustering.instantiate().threshold = clustering_threshold  
                         except:
                             pass  # If configuration fails, continue with defaults
                     
@@ -756,16 +803,16 @@ class WorkingGPUDiarizationServer:
                     diarization_result = self.diarization_pipeline(preprocessed_audio_path)
                     
                     # FIXED: Use manual speaker assignment instead of broken whisperx function
-                    result = self.manual_speaker_assignment(result, diarization_result)
+                    result = self.manual_speaker_assignment(result, diarization_result, speaker_confidence_threshold)
                     
                     # Apply spurious speaker filtering
-                    result = self.filter_spurious_speakers(result)
+                    result = self.filter_spurious_speakers(result, min_speaker_duration, speaker_confidence_threshold)
                     
                     # Apply speaker smoothing
-                    result = self.smooth_speaker_changes(result)
+                    result = self.smooth_speaker_changes(result, speaker_smoothing_enabled, min_switch_duration)
 
                     # Apply VAD validation
-                    if self.vad_validation_enabled:
+                    if vad_validation_enabled:
                         result = self.validate_speakers_with_vad(result, audio_path)
                     else:
                         logger.info("VAD validation disabled - skipping")
@@ -796,15 +843,173 @@ class WorkingGPUDiarizationServer:
                         except Exception as cleanup_error:
                             logger.warning(f"Failed to clean up temporary file {preprocessed_audio_path}: {cleanup_error}")
             
-            return {
-                "status": "success",
-                "result": result,
-                "processing_info": {
-                    "device": self.device,
-                    "language_detected": result.get("language", "en"),
-                    "audio_duration": getattr(result, "duration", 0)
-                }
+            # Count speakers from segments
+            total_speakers = 0
+            confident_speakers = 0
+            if 'segments' in result:
+                speakers_found = set()
+                confident_speakers_found = set()
+                for segment in result['segments']:
+                    if 'speaker' in segment:
+                        speakers_found.add(segment['speaker'])
+                        if segment.get('speaker_confidence', 0) >= speaker_confidence_threshold:
+                            confident_speakers_found.add(segment['speaker'])
+                
+                total_speakers = len(speakers_found)
+                confident_speakers = len(confident_speakers_found)
+            
+            # Apply timestamp granularity filtering
+            granularities = [g.strip().lower() for g in timestamp_granularities.split(',')]
+            
+            # Convert numpy types to JSON-serializable types first
+            result = convert_numpy_types(result)
+            
+            # Create the base response structure
+            filtered_result = {}
+            
+            # Handle timestamp granularities filtering with improved logic
+            logger.info(f"Applying timestamp granularities filter: {granularities}")
+            
+            if 'segment' in granularities and 'word' in granularities:
+                # Both segment and word level - keep everything
+                filtered_result = result.copy()
+                logger.info("Keeping both segment and word level timestamps")
+            elif 'segment' in granularities and 'word' not in granularities:
+                # Only segment level - remove ALL word-level data
+                filtered_result = result.copy()
+                logger.info("Filtering to segment-only timestamps - removing word data")
+                
+                # Remove root level word arrays
+                filtered_result.pop('words', None)
+                filtered_result.pop('word_segments', None)  # In case this exists
+                
+                # Remove word-level data from segments
+                if 'segments' in filtered_result:
+                    for segment in filtered_result['segments']:
+                        # Remove word-level timestamps but keep segment-level speaker info
+                        segment.pop('words', None)
+                        # Also remove any other word-level fields that might exist
+                        segment.pop('word_segments', None)
+                        
+                logger.info(f"Segments after word removal: {len(filtered_result.get('segments', []))}")
+                
+            elif 'word' in granularities and 'segment' not in granularities:
+                # Only word level - remove segments completely, keep only word data
+                filtered_result = result.copy()
+                logger.info("Filtering to word-only timestamps - removing segments")
+                
+                # Collect all words from segments before removing segments
+                all_words = []
+                if 'segments' in filtered_result:
+                    for segment in filtered_result['segments']:
+                        if 'words' in segment:
+                            all_words.extend(segment['words'])
+                
+                # If no root-level words exist but we have segment words, move them to root
+                if 'words' not in filtered_result and all_words:
+                    filtered_result['words'] = all_words
+                
+                # Completely remove segments structure
+                filtered_result.pop('segments', None)
+                
+                # Keep only word-level data at root level
+                logger.info(f"Word-only result structure: root_words={'words' in filtered_result}, total_words={len(filtered_result.get('words', []))}, segments_removed=True")
+                        
+            else:
+                # Default: keep segments if available, remove words to match default behavior
+                filtered_result = result.copy()
+                logger.info("Using default granularity (segment-only)")
+                # Default to segment-only behavior
+                filtered_result.pop('words', None)
+                if 'segments' in filtered_result:
+                    for segment in filtered_result['segments']:
+                        segment.pop('words', None)
+            
+            # Handle diarization consistency
+            if not enable_diarization:
+                # Remove all speaker-related information
+                if 'segments' in filtered_result:
+                    for segment in filtered_result['segments']:
+                        segment.pop('speaker', None)
+                        segment.pop('speaker_confidence', None)
+                        if 'words' in segment:
+                            for word in segment['words']:
+                                word.pop('speaker', None)
+                                word.pop('speaker_confidence', None)
+                if 'words' in filtered_result:
+                    for word in filtered_result['words']:
+                        word.pop('speaker', None)
+                        word.pop('speaker_confidence', None)
+            
+            # Build processing info
+            processing_info = {
+                "device": self.device,
+                "language_detected": filtered_result.get("language", "en"),
+                "audio_duration": getattr(filtered_result, "duration", 0),
+                "total_speakers": total_speakers,
+                "confident_speakers": confident_speakers,
+                "timestamp_granularities": granularities,
+                "diarization_enabled": enable_diarization
             }
+            
+            # Generate text-only content for use in various output formats
+            text_content = ""
+            if 'segments' in filtered_result:
+                text_content = "\n".join([segment.get('text', '') for segment in filtered_result.get('segments', [])])
+            elif 'words' in filtered_result:
+                # Extract text from word-level data when segments are not available
+                words_text = ' '.join([word.get('word', word.get('text', '')) for word in filtered_result.get('words', [])])
+                text_content = words_text
+            elif 'text' in filtered_result:
+                text_content = filtered_result['text']
+            
+            # Filter response based on output_content
+            if output_content == "text_only":
+                # Return only the transcribed text, no timestamps
+                return {"text": text_content.strip()}
+            
+            elif output_content == "timestamps_only":
+                # Return timestamped segments with text (respecting granularity settings)
+                logger.info(f"Processing timestamps_only output with granularities: {granularities}")
+                
+                # Return the filtered result with timestamps AND text content
+                return {
+                    "status": "success", 
+                    "result": filtered_result,
+                    "processing_info": processing_info
+                }
+            
+            elif output_content == "both":
+                # Return separate text-only section AND timestamped results
+                return {
+                    "status": "success",
+                    "text": text_content.strip(),
+                    "result": filtered_result,
+                    "processing_info": processing_info
+                }
+            
+            elif output_content == "metadata_only":
+                # Return only processing info and metadata
+                speakers_list = []
+                if enable_diarization and 'segments' in filtered_result:
+                    speakers_list = list(set(segment.get('speaker', 'SPEAKER_00') 
+                                           for segment in filtered_result.get('segments', []) 
+                                           if 'speaker' in segment))
+                
+                return {
+                    "status": "success",
+                    "processing_info": processing_info,
+                    "speakers": speakers_list
+                }
+            
+            else:
+                # Default fallback to 'both' format
+                return {
+                    "status": "success",
+                    "text": text_content.strip(),
+                    "result": filtered_result,
+                    "processing_info": processing_info
+                }
             
         except Exception as e:
             logger.error(f"Transcription failed: {e}")
@@ -861,15 +1066,79 @@ async def health_check():
 
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
-    file: UploadFile = File(...),
-    enable_diarization: bool = Form(True),
-    response_format: str = Form("json")
+    file: UploadFile = File(..., description="Audio file to transcribe"),
+    # Core parameters
+    enable_diarization: bool = Form(True, description="Enable speaker diarization"),
+    response_format: str = Form("json", description="Response format: json, verbose_json, text, srt, vtt"),
+    language: str = Form("en", description="Language code (e.g., 'en', 'es', 'fr', 'de')"),
+    model: str = Form("large-v2", description="[IGNORED] Whisper model to use: tiny, base, small, medium, large, large-v2, large-v3 - Currently always uses large-v2"),
+    
+    # OpenAI API compliance parameters
+    prompt: str = Form("", description="Optional text prompt to provide context or guide the transcription"),
+    temperature: float = Form(0.0, description="[IGNORED] Sampling temperature (0.0-1.0, higher values increase randomness) - Limited WhisperX support"),
+    timestamp_granularities: str = Form("segment", description="Timestamp granularity: 'segment' or 'word' (comma-separated for both)"),
+    output_content: str = Form("both", description="Content to include in output: 'both', 'text_only', 'timestamps_only', 'metadata_only'"),
+    
+    # Processing parameters
+    batch_size: int = Form(8, description="Batch size for processing (higher = faster but more memory)"),
+    
+    # Diarization parameters (only used if enable_diarization=True)
+    clustering_threshold: float = Form(0.7, description="Speaker clustering threshold (0.5-1.0, lower = more speakers)"),
+    segmentation_threshold: float = Form(0.45, description="Voice activity detection threshold (0.1-0.9)"),
+    min_speaker_duration: float = Form(3.0, description="Minimum speaking time per speaker (seconds)"),
+    speaker_confidence_threshold: float = Form(0.6, description="Minimum confidence for speaker assignment (0.1-1.0)"),
+    speaker_smoothing_enabled: bool = Form(True, description="Enable speaker transition smoothing"),
+    min_switch_duration: float = Form(2.0, description="Minimum time between speaker switches (seconds)"),
+    vad_validation_enabled: bool = Form(False, description="Enable Voice Activity Detection validation (experimental)")
 ):
     """
-    WORKING transcription endpoint with FIXED diarization
+    **Transcribe audio with advanced diarization and configuration options**
+    
+    This endpoint provides comprehensive audio transcription with speaker diarization.
+    
+    **Core Features:**
+    - Multi-language transcription support
+    - Advanced speaker diarization with confidence scoring
+    - Multiple output formats (JSON, SRT, VTT, plain text)
+    - GPU-accelerated processing
+    - Configurable model selection
+    
+    **Response Formats:**
+    - `json`: Standard JSON with segments and words
+    - `verbose_json`: Detailed JSON with speaker confidence and metadata 
+    - `text`: Plain text transcription only
+    - `srt`: SubRip subtitle format with timestamps
+    - `vtt`: WebVTT subtitle format
+    
+    **OpenAI API Compatibility:**
+    - `prompt`: Optional text to guide the transcription (context, spelling, etc.)
+    - `timestamp_granularities`: Control timestamp detail ('segment', 'word', or 'segment,word')
+    - `output_content`: Control response content ('all', 'text_only', 'metadata_only')
+    
+    **Diarization Parameters:**
+    - `clustering_threshold`: Controls speaker separation (lower = more speakers detected)
+    - `segmentation_threshold`: Voice activity sensitivity (lower = more sensitive)
+    - `speaker_confidence_threshold`: Quality filter for speaker assignments
+    - `min_speaker_duration`: Filters out speakers with brief speaking time
+    
+    **Performance Tips:**
+    - Use higher `batch_size` for faster processing (requires more GPU memory)
+    - Use smaller models (base, small) for faster processing with less accuracy
+    - Disable diarization for single-speaker audio to improve speed
+    - Use `prompt` parameter to improve accuracy for technical terms or proper names
     """
     temp_audio_path = None
     try:
+        # Log ignored parameters for transparency
+        ignored_params = []
+        if model != "large-v2":
+            ignored_params.append(f"model={model} (using large-v2)")
+        if temperature != 0.0:
+            ignored_params.append(f"temperature={temperature} (using 0.0)")
+        
+        if ignored_params:
+            logger.info(f"ℹ️  Ignored parameters in this request: {', '.join(ignored_params)}")
+        
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
             temp_audio_path = temp_file.name
@@ -878,13 +1147,58 @@ async def create_transcription(
         # Process with fixed transcription
         result = await server.transcribe_with_diarization(
             temp_audio_path, 
-            enable_diarization=enable_diarization
+            enable_diarization=enable_diarization,
+            language=language,
+            model=model,
+            batch_size=batch_size,
+            prompt=prompt,
+            temperature=temperature,
+            timestamp_granularities=timestamp_granularities,
+            output_content=output_content,
+            clustering_threshold=clustering_threshold,
+            segmentation_threshold=segmentation_threshold,
+            min_speaker_duration=min_speaker_duration,
+            speaker_confidence_threshold=speaker_confidence_threshold,
+            speaker_smoothing_enabled=speaker_smoothing_enabled,
+            min_switch_duration=min_switch_duration,
+            vad_validation_enabled=vad_validation_enabled
         )
         
         if response_format == "json":
             return result
+        elif response_format == "verbose_json":
+            return result  # Return as proper JSON response
+        elif response_format == "text":
+            # Extract just the text content
+            text_content = "\n".join([segment.get('text', '') for segment in result.get('result', {}).get('segments', [])])
+            return PlainTextResponse(content=text_content.strip())
+        elif response_format == "srt":
+            # Generate SRT format
+            segments = result.get('result', {}).get('segments', [])
+            srt_content = ""
+            for i, segment in enumerate(segments, 1):
+                start_time = segment.get('start', 0)
+                end_time = segment.get('end', 0)
+                text = segment.get('text', '').strip()
+                start_srt = f"{int(start_time//3600):02d}:{int((start_time%3600)//60):02d}:{start_time%60:06.3f}".replace('.', ',')
+                end_srt = f"{int(end_time//3600):02d}:{int((end_time%3600)//60):02d}:{end_time%60:06.3f}".replace('.', ',')
+                srt_content += f"{i}\n{start_srt} --> {end_srt}\n{text}\n\n"
+            return PlainTextResponse(content=srt_content.strip())
+        elif response_format == "vtt":
+            # Generate WebVTT format
+            segments = result.get('result', {}).get('segments', [])
+            vtt_content = "WEBVTT\n\n"
+            for segment in segments:
+                start_time = segment.get('start', 0)
+                end_time = segment.get('end', 0)
+                text = segment.get('text', '').strip()
+                start_vtt = f"{int(start_time//3600):02d}:{int((start_time%3600)//60):02d}:{start_time%60:06.3f}"
+                end_vtt = f"{int(end_time//3600):02d}:{int((end_time%3600)//60):02d}:{end_time%60:06.3f}"
+                vtt_content += f"{start_vtt} --> {end_vtt}\n{text}\n\n"
+            return PlainTextResponse(content=vtt_content.strip())
         else:
-            return PlainTextResponse(content=str(result))
+            # Default: return as JSON
+            return result
             
     except Exception as e:
         logger.error(f"Transcription request failed: {e}")
@@ -910,6 +1224,6 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=3337,
+        port=3333,
         log_level="info"
-    ) 
+    )

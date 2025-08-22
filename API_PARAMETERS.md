@@ -18,7 +18,7 @@
 ### WhisperX Enhanced Parameters
 | Parameter | Type | Default | Description | Example |
 |-----------|------|---------|-------------|---------|
-| `output_content` | String | "both" | Response content control | "text_only", "timestamps_only", "both" |
+| `output_content` | String | "both" | Response content control | "text_only", "timestamps_only", "both", "metadata_only" |
 | `enable_diarization` | Boolean | false | Enable speaker identification | true, false |
 | `min_speakers` | Integer | None | Minimum speakers for diarization | 2 |
 | `max_speakers` | Integer | None | Maximum speakers for diarization | 5 |
@@ -47,8 +47,9 @@
 
 ### `output_content` Options
 - **`text_only`**: Only transcribed text, no timestamps
-- **`timestamps_only`**: Only timing information, no text
-- **`both`**: Complete transcription with timestamps (default)
+- **`timestamps_only`**: Only timing information, no text content
+- **`both`**: Separate text-only section AND timestamped results (default)
+- **`metadata_only`**: Only processing information and speaker metadata
 
 ### `language` Codes (ISO-639-1)
 Common language codes:
@@ -159,6 +160,81 @@ Common language codes:
 }
 ```
 
+### Output Content Format Examples
+
+#### text_only Format
+```json
+{
+  "text": "Hello there. How are you today?"
+}
+```
+
+#### timestamps_only Format
+```json
+{
+  "status": "success",
+  "result": {
+    "segments": [
+      {
+        "start": 0.0,
+        "end": 2.5,
+        "speaker": "SPEAKER_00"
+      },
+      {
+        "start": 2.5,
+        "end": 4.0,
+        "speaker": "SPEAKER_01"
+      }
+    ],
+    "words": [
+      {
+        "start": 0.0,
+        "end": 0.5,
+        "word_prob": 0.95,
+        "speaker": "SPEAKER_00"
+      }
+    ]
+  },
+  "processing_info": {...}
+}
+```
+
+#### both Format (Default)
+```json
+{
+  "status": "success",
+  "text": "Hello there. How are you today?",
+  "result": {
+    "segments": [
+      {
+        "start": 0.0,
+        "end": 2.5,
+        "text": "Hello there.",
+        "speaker": "SPEAKER_00"
+      }
+    ],
+    "words": [...]
+  },
+  "processing_info": {...}
+}
+```
+
+#### metadata_only Format
+```json
+{
+  "status": "success",
+  "processing_info": {
+    "device": "cuda",
+    "language_detected": "en",
+    "total_speakers": 2,
+    "confident_speakers": 2,
+    "timestamp_granularities": ["segment"],
+    "diarization_enabled": true
+  },
+  "speakers": ["SPEAKER_00", "SPEAKER_01"]
+}
+```
+
 ## cURL Examples
 
 ### Basic Usage
@@ -209,24 +285,6 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
 - **Language Support**: Primarily English
 - **Performance**: Minimal impact
 
-## Removed Parameters (No longer supported in WhisperX)
-
-These parameters were available in the original Whisper implementation but are **NOT supported** in WhisperX:
-
-- `beam_size` - Beam search size
-- `vad_filter` - Voice Activity Detection filter
-- `vad_threshold` - VAD sensitivity threshold
-- `min_silence_duration_ms` - Minimum silence duration
-- `condition_on_previous_text` - Text conditioning
-- `best_of` - Number of candidates
-- `patience` - Beam search patience
-- `compression_ratio_threshold` - Compression ratio limit
-- `log_prob_threshold` - Log probability threshold
-- `no_speech_threshold` - No speech detection threshold
-
-## Migration Notes
-
-If you were using the original Whisper API with these parameters, they should be removed from your requests as they are no longer functional and may cause confusion.
 
 ## Testing the API
 
