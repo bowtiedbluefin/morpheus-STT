@@ -10,14 +10,14 @@ WORKDIR /app
 # Copy requirements and install with selective filtering
 COPY requirements.txt .
 
-# Install core packages with specific versions first
+# Install core packages with EXACT versions matching working venv
 RUN pip install --no-cache-dir --prefix="/install" psutil && \
     pip install --no-cache-dir --prefix="/install" torch==2.6.0+cu126 torchaudio==2.6.0+cu126 torchvision==0.21.0+cu126 --index-url https://download.pytorch.org/whl/cu126 && \
     pip install --no-cache-dir --prefix="/install" ctranslate2==4.4.0 && \
     pip install --no-cache-dir --prefix="/install" whisperx==3.4.2
 
-# Install remaining packages including text processing libraries
-# Includes: nemo-text-processing (with pynini/OpenFST), contractions, and other dependencies
+# Install remaining packages including text processing libraries and pyannote.audio
+# Includes: nemo-text-processing (with pynini/OpenFST), contractions, pyannote.audio, and other dependencies
 # Note: nemo-text-processing works on Linux x86_64 with existing build-essential
 RUN grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" > requirements_filtered.txt && \
     pip install --no-cache-dir --prefix="/install" -r requirements_filtered.txt
@@ -30,7 +30,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH="/install/lib/python3.12/site-packages"
 
-# CRITICAL: PyTorch CUDA library isolation to fix cuDNN version conflicts
+# PyTorch CUDA library isolation for optimal performance
 ENV LD_LIBRARY_PATH="/install/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/install/lib/python3.12/site-packages/nvidia/cudnn/lib:/install/lib/python3.12/site-packages/nvidia/cublas/lib:/install/lib/python3.12/site-packages/nvidia/cufft/lib:/install/lib/python3.12/site-packages/nvidia/curand/lib:/install/lib/python3.12/site-packages/nvidia/cusolver/lib:/install/lib/python3.12/site-packages/nvidia/cusparse/lib"
 
 # Install system dependencies including Python 3.12
@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y \
     software-properties-common \
     ffmpeg \
     libsndfile1 \
+    python3-pip \
  && add-apt-repository ppa:deadsnakes/ppa \
  && apt-get update \
  && apt-get install -y python3.12 python3.12-dev python3.12-venv \
@@ -61,9 +62,14 @@ ENV MIN_SEGMENT_LENGTH=0.5
 ENV MAX_SEGMENT_LENGTH=30.0
 ENV SPEECH_THRESHOLD=0.6
 
-# Speaker Attribution Improvements
+# Speaker Attribution Improvements (Optimized Diarization System)
+ENV PYANNOTE_CLUSTERING_THRESHOLD=0.7
+ENV PYANNOTE_SEGMENTATION_THRESHOLD=0.45
+ENV SPEAKER_CONFIDENCE_THRESHOLD=0.6
+ENV MIN_SPEAKER_DURATION=3.0
 ENV SPEAKER_SMOOTHING_ENABLED=true
-ENV SPEAKER_CONFIDENCE_THRESHOLD=0.8
+ENV MIN_SWITCH_DURATION=2.0
+ENV VAD_VALIDATION_ENABLED=false
 
 # WhisperX Core Settings
 ENV ALIGN_MODEL=WAV2VEC2_ASR_LARGE_LV60K_960H
@@ -83,7 +89,7 @@ USER appuser
 # Copy application and dependencies from builder
 COPY --from=builder /install /install
 COPY python_server.py .
-COPY config_examples.env .
+COPY env.example .
 
 # Expose port and run application
 EXPOSE 3333

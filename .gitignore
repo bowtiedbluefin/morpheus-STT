@@ -67,6 +67,7 @@ celerybeat-schedule
 
 # Environments
 .env
+working_gpu.env
 .venv
 env/
 venv/
@@ -123,6 +124,12 @@ Morpheus*
 *.mp3
 *.wav
 *.json
+*sensitivity_analysis*
+sensitivity_analysis.py
+final_speaker_attribution_test.py
+sensitivity_analysis.json
+sensitivity_analysis.py
+
 
 # Output files
 *.srt
