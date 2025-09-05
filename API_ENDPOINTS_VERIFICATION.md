@@ -52,18 +52,17 @@ POST /v1/uploads
 **Test:**
 ```bash
 curl -X POST https://your-server/v1/uploads \
-  -F 'file=@test_audio.wav' \
-  -F 'bucket=sonartext-uploads'
+  -F 'file=@test_audio.wav'
 ```
 
 **Expected Response:**
 ```json
 {
   "status": "success",
-  "r2_bucket": "sonartext-uploads",
-  "r2_key": "uploads/20241201_143022_123456.wav",
+  "bucket": "default-uploads",
+  "key": "uploads/20241201_143022_123456.wav",
   "file_size": 1024000,
-  "storage_url": "s3://sonartext-uploads/uploads/20241201_143022_123456.wav"
+  "storage_url": "s3://default-uploads/uploads/20241201_143022_123456.wav"
 }
 ```
 
@@ -88,8 +87,7 @@ curl -X POST https://your-server/v1/audio/transcriptions \
 ```bash
 curl -X POST https://your-server/v1/audio/transcriptions \
   -H 'Content-Type: application/x-www-form-urlencoded' \
-  -d 'r2_bucket=sonartext-uploads' \
-  -d 'r2_key=uploads/file.wav' \
+  -d 'storage_key=uploads/20241201_143022_123456.wav' \
   -d 'response_format=verbose_json'
 ```
 
@@ -133,13 +131,13 @@ curl -X POST https://your-server/v1/audio/transcriptions \
 
 ### **Mutually Exclusive Inputs (choose ONE)**
 - `file` (multipart file upload)
-- `r2_bucket` + `r2_key` (R2 object reference)
+- `storage_key` (R2 object reference)
 - `s3_presigned_url` (pre-signed S3 URL)
 
 **Error if none provided:**
 ```json
 {
-  "detail": "One input source required: file upload, R2 object (r2_bucket+r2_key), or s3_presigned_url"
+  "detail": "One input source required: file upload, storage_key, or s3_presigned_url"
 }
 ```
 

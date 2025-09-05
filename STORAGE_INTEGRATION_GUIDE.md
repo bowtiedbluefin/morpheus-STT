@@ -1,8 +1,8 @@
-# 🚀 morpheus-STT Storage Integration Guide
+# 🚀 Whisper Server Storage Integration Guide
 
 ## Overview
 
-morpheus-STT now supports multiple input sources and automatic result export to cloud storage, including:
+The whisper server now supports multiple input sources and automatic result export to cloud storage, including:
 
 - **Cloudflare R2** integration for cost-effective TB-scale processing
 - **Pre-signed S3 URLs** for secure file access without credential exposure
@@ -69,18 +69,17 @@ Upload files directly to R2 bucket:
 
 ```bash
 curl -X POST http://localhost:3333/v1/uploads \
-  -F 'file=@audio.wav' \
-  -F 'bucket=sonartext-uploads'
+  -F 'file=@audio.wav'
 ```
 
 **Response:**
 ```json
 {
   "status": "success",
-  "r2_bucket": "sonartext-uploads",
-  "r2_key": "uploads/20241201_143022_123456.wav",
+  "bucket": "default-uploads",
+  "key": "uploads/20241201_143022_123456.wav",
   "file_size": 1024000,
-  "storage_url": "s3://sonartext-uploads/uploads/20241201_143022_123456.wav"
+  "storage_url": "s3://default-uploads/uploads/20241201_143022_123456.wav"
 }
 ```
 
@@ -101,8 +100,7 @@ curl -X POST http://localhost:3333/v1/audio/transcriptions \
 #### Mode 2: R2 Object Reference
 ```bash
 curl -X POST http://localhost:3333/v1/audio/transcriptions \
-  -d 'r2_bucket=sonartext-uploads' \
-  -d 'r2_key=uploads/20241201_143022_123456.wav' \
+  -d 'storage_key=uploads/20241201_143022_123456.wav' \
   -d 'response_format=verbose_json'
 ```
 
@@ -126,19 +124,19 @@ curl -X POST http://localhost:3333/v1/audio/transcriptions \
 
 ### Before
 ```
-Browser → SonarText API → morpheus-STT
+Browser → API Service → Whisper Server
          (bandwidth costs)
 ```
 
 ### After
 ```
-Browser → R2 (direct upload) → morpheus-STT (R2 download)
+Browser → R2 (direct upload) → Whisper Server (R2 download)
          (zero bandwidth)     → R2/S3 (result export)
 ```
 
 ### Key Advantages
 
-1. **Zero Bandwidth Costs**: Files bypass SonarText API servers
+1. **Zero Bandwidth Costs**: Files bypass API service servers
 2. **TB-Scale Processing**: R2 handles 6GB+ files with multipart uploads
 3. **Workflow Automation**: Automatic result export to designated buckets
 4. **Security**: Pre-signed URLs eliminate credential exposure
@@ -151,17 +149,15 @@ Browser → R2 (direct upload) → morpheus-STT (R2 download)
 ```bash
 # Step 1: Upload large file to R2
 curl -X POST http://localhost:3333/v1/uploads \
-  -F 'file=@large_audio.wav' \
-  -F 'bucket=sonartext-uploads'
+  -F 'file=@large_audio.wav'
 
-# Response: {"r2_bucket": "sonartext-uploads", "r2_key": "uploads/..."}
+# Response: {"bucket": "default-uploads", "key": "uploads/..."}
 
 # Step 2: Process from R2 with result export  
 curl -X POST http://localhost:3333/v1/audio/transcriptions \
-  -d 'r2_bucket=sonartext-uploads' \
-  -d 'r2_key=uploads/20241201_143022_123456.wav' \
-  -d 'output_bucket=transcription-results' \
-  -d 'output_use_r2=true' \
+  -d 'storage_key=uploads/20241201_143022_123456.wav' \
+  -d 'output_key=transcriptions/result.json' \
+  -d 'stored_output=true' \
   -d 'enable_diarization=true' \
   -d 'response_format=verbose_json'
 ```
@@ -243,7 +239,7 @@ python test_storage_integration.py
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `file` | UploadFile | Direct file upload (traditional) |
-| `r2_bucket + r2_key` | str + str | Cloudflare R2 object reference |
+| `storage_key` | str | Cloudflare R2 object reference |
 | `s3_presigned_url` | str | Pre-signed S3 URL |
 
 ### Output Parameters (optional)
@@ -262,8 +258,8 @@ python test_storage_integration.py
 ## 🎯 Use Cases
 
 ### 1. **Cost Optimization** (Primary Goal)
-- Large files → R2 direct upload → morpheus-STT
-- Eliminates bandwidth charges through SonarText API
+- Large files → R2 direct upload → Whisper Server
+- Eliminates bandwidth charges through API service
 
 ### 2. **Enterprise Security**  
 - Pre-signed S3 URLs enable access without credential sharing
@@ -311,17 +307,16 @@ python test_storage_integration.py
      -F 'file=@test.wav' \
      -F 'bucket=your-bucket'
    
-   # Transcribe from R2  
-   curl -X POST http://localhost:3333/v1/audio/transcriptions \
-     -d 'r2_bucket=your-bucket' \
-     -d 'r2_key=uploads/...' \
-     -d 'response_format=json'
+     # Transcribe from R2  
+  curl -X POST http://localhost:3333/v1/audio/transcriptions \
+    -d 'storage_key=uploads/...' \
+    -d 'response_format=json'
    ```
 
 ## 💡 Migration Strategy
 
 ### Phase 1: Immediate (Backward Compatible)
-- Deploy morpheus-STT with new code
+- Deploy whisper server with new code
 - Existing clients continue working unchanged
 - New R2 functionality available for testing
 

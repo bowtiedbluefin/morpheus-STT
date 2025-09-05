@@ -37,21 +37,19 @@ Should show `"r2_enabled": true`
 ```bash
 # Step 1: Upload large file to R2
 curl -X POST localhost:3333/v1/uploads \
-  -F 'file=@large_audio.wav' \
-  -F 'bucket=sonartext-uploads'
+  -F 'file=@large_audio.wav'
 
-# Returns: {"r2_bucket": "sonartext-uploads", "r2_key": "uploads/..."}
+# Returns: {"bucket": "default-uploads", "key": "uploads/..."}
 
 # Step 2: Transcribe from R2 (zero bandwidth through your API)
 curl -X POST localhost:3333/v1/audio/transcriptions \
-  -d 'r2_bucket=sonartext-uploads' \
-  -d 'r2_key=uploads/20241201_143022_123456.wav' \
+  -d 'storage_key=uploads/20241201_143022_123456.wav' \
   -d 'response_format=verbose_json'
 ```
 
 ### **Pattern 2: Pre-signed S3 URL (No Server Credentials Needed)**
 ```bash
-# Your frontend generates pre-signed URL, then sends it to morpheus-STT
+# Your frontend generates pre-signed URL, then sends it to the whisper server
 curl -X POST localhost:3333/v1/audio/transcriptions \
   -d 's3_presigned_url=https://customer-bucket.s3.amazonaws.com/audio?X-Amz-Algorithm=...' \
   -d 'response_format=json'
@@ -97,20 +95,19 @@ python test_storage_integration.py
 // Upload to R2 first
 const uploadResponse = await fetch('/v1/uploads', {
   method: 'POST',
-  body: formData // contains file + bucket
+  body: formData // contains file
 });
 
-const {r2_bucket, r2_key} = await uploadResponse.json();
+const {bucket, key} = await uploadResponse.json();
 
 // Then transcribe from R2 with result export
 const transcribeResponse = await fetch('/v1/audio/transcriptions', {
   method: 'POST',
   headers: {'Content-Type': 'application/x-www-form-urlencoded'},
   body: new URLSearchParams({
-    r2_bucket: r2_bucket,
-    r2_key: r2_key,
-    output_bucket: 'customer-results',
-    output_use_r2: 'true',
+    storage_key: key,
+    output_key: 'transcriptions/result.json',
+    stored_output: 'true',
     response_format: 'verbose_json'
   })
 });

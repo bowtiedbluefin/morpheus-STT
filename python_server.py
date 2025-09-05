@@ -51,6 +51,10 @@ load_dotenv("working_gpu.env")  # Load specific config for working GPU server
 r2_client = None
 s3_client = None
 
+# Default storage buckets from environment variables
+DEFAULT_UPLOAD_BUCKET = os.getenv('DEFAULT_UPLOAD_BUCKET', 'default-uploads')
+DEFAULT_RESULTS_BUCKET = os.getenv('DEFAULT_RESULTS_BUCKET', 'default-results')
+
 def init_storage_clients():
     """Initialize R2 and S3 clients if credentials are provided"""
     global r2_client, s3_client
@@ -1141,7 +1145,7 @@ async def upload_result_to_storage(result: dict, bucket: str, key: str, use_r2: 
             Body=result_json.encode('utf-8'),
             ContentType='application/json',
             Metadata={
-                'uploaded_by': 'morpheus-stt',
+                'uploaded_by': 'whisper-server',
                 'timestamp': datetime.now().isoformat(),
                 'content_type': 'transcription_result'
             }
@@ -1226,40 +1230,37 @@ async def health_check():
     }
 
 @app.post("/v1/uploads")
-async def upload_to_r2(
+async def upload_files(
     file: UploadFile = File(..., description="Audio file to upload"),
-    bucket: Optional[str] = Form(None, description="Storage bucket name (optional - uses default if not specified)"),
     key: Optional[str] = Form(None, description="Object key (auto-generated if not provided)")
 ):
     """
-    Upload audio file directly to cloud storage
+    Upload Files
     
-    This endpoint uploads files directly to cloud storage and returns the 
-    object reference that can be used later for transcription.
+    Upload audio files directly to cloud storage and receive the object reference 
+    that can be used later for transcription.
     
     **Parameters:**
-    - `file`: The audio file to upload
-    - `bucket`: Optional storage bucket name (uses server default if not specified)
-    - `key`: Optional custom object key (if not provided, generates timestamp-based key)
+    - `file`: The audio file to upload  
+    - `key`: Optional custom object key (auto-generated if not provided)
     
     **Returns:**
     - Storage object details including bucket, key, and file info
     """
     if not r2_client:
-        raise HTTPException(500, "Cloud storage client not configured. Check storage credentials in server environment.")
+        raise HTTPException(500, "Cloud storage not configured. Check server storage credentials.")
+    
+    # Use environment-configured bucket
+    bucket = DEFAULT_UPLOAD_BUCKET
+    logger.info(f"Using configured upload bucket: {bucket}")
+        
+    # Generate key if not provided
+    if not key:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        file_ext = os.path.splitext(file.filename or "audio")[1] or ".wav"
+        key = f"uploads/{timestamp}{file_ext}"
     
     try:
-        # Use default bucket if not provided
-        if not bucket:
-            bucket = os.getenv('DEFAULT_UPLOAD_BUCKET', 'uploads')  # Default bucket name
-            logger.info(f"Using default bucket: {bucket}")
-        
-        # Generate key if not provided
-        if not key:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            file_ext = os.path.splitext(file.filename or "audio")[1] or ".wav"
-            key = f"uploads/{timestamp}{file_ext}"
-        
         # Read file content
         file_content = await file.read()
         file_size = len(file_content)
@@ -1305,16 +1306,14 @@ async def upload_to_r2(
 
 @app.post("/v1/downloads")
 async def download_from_storage(
-    bucket: str = Form(..., description="Storage bucket name"),
-    key: str = Form(..., description="Object key/path of the file to download")
+    key: str = Form(..., description="Object key/path of the file to download (e.g., transcriptions/filename.json)")
 ):
     """
-    Download file from cloud storage
+    Download From Storage
     
-    This endpoint allows you to retrieve files stored in cloud storage.
+    Download transcription results and other files from cloud storage.
     
     **Parameters:**
-    - `bucket`: Storage bucket name
     - `key`: Object key/path of the file to download
     
     **Returns:**
@@ -1322,6 +1321,10 @@ async def download_from_storage(
     """
     if not r2_client:
         raise HTTPException(500, "Cloud storage client not configured")
+    
+    # Use environment-configured bucket
+    bucket = DEFAULT_RESULTS_BUCKET
+    logger.info(f"Downloading from configured results bucket: {bucket}")
     
     try:
         # Get the object from storage
@@ -1349,18 +1352,18 @@ async def download_from_storage(
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
     # === FILE INPUT SECTION ===
-    file: Optional[UploadFile] = File(None, description="Audio file to upload and transcribe"),
-    storage_bucket: Optional[str] = Form(None, description="Existing file bucket name"), 
-    storage_key: Optional[str] = Form(None, description="Existing file object key"),
-    s3_presigned_url: Optional[str] = Form(None, description="Pre-signed S3/storage URL to download file from"),
+    file: UploadFile = File(..., description="Audio file to upload and transcribe"),
+    
+    # === FILE REFERENCE OPTIONS ===
+    storage_key: Optional[str] = Form(None, description="Storage object key for existing file"),
+    s3_presigned_url: Optional[str] = Form(None, description="Pre-signed URL to download audio file from S3"),
     
     # === TRANSCRIPTION OUTPUT SECTION ===
     response_format: str = Form("json", description="Response format: json, verbose_json, text, srt, vtt"),
     output_content: str = Form("both", description="Include both JSON and plain text in response"),
-    stored_output: bool = Form(False, description="Save to cloud storage? True=R2 bucket, False=S3 bucket"),
-    output_bucket: Optional[str] = Form(None, description="Storage bucket name (for server storage)"),
+    stored_output: bool = Form(False, description="Storage type - True: Primary storage, False: S3 bucket"),
     output_key: Optional[str] = Form(None, description="Custom storage object key (auto-generated if not provided)"),
-    upload_presigned_url: Optional[str] = Form(None, description="Pre-signed upload URL to user's own S3 bucket (overrides server storage)"),
+    upload_presigned_url: Optional[str] = Form(None, description="Pre-signed upload URL to save results to your own S3 bucket (overrides server storage)"),
     
     # === TRANSCRIPTION SETTINGS SECTION ===
     language: str = Form("en", description="Language code (e.g., 'en', 'es', 'fr', 'de')"),
@@ -1376,11 +1379,7 @@ async def create_transcription(
     speaker_confidence_threshold: float = Form(0.6, description="Minimum confidence for speaker assignment (0.1-1.0)"),
     speaker_smoothing_enabled: bool = Form(True, description="Enable speaker transition smoothing"),
     min_switch_duration: float = Form(2.0, description="Minimum time between speaker switches (seconds)"),
-    vad_validation_enabled: bool = Form(False, description="Enable Voice Activity Detection validation (experimental)"),
-    
-    # === COMPATIBILITY PARAMETERS (accepted but may be ignored) ===
-    model: str = Form("large-v2", description="[IGNORED] Whisper model specification - server always uses optimized model"),
-    temperature: float = Form(0.0, description="[IGNORED] Sampling temperature - not supported by current engine")
+    vad_validation_enabled: bool = Form(False, description="Enable Voice Activity Detection validation (experimental)")
 ):
     """
     **Advanced Audio Transcription with Speaker Identification**
@@ -1390,13 +1389,13 @@ async def create_transcription(
     
     **📁 File Input Options (choose ONE):**
     - `file`: Direct file upload (recommended for most use cases)
-    - `storage_bucket + storage_key`: Reference to existing file in storage 
+    - `storage_key`: Reference to existing file in configured storage bucket
     - `s3_presigned_url`: Pre-signed URL for secure file access
     
     **📄 Transcription Output:**
     - `response_format`: Choose output format (JSON, SRT, VTT, plain text)
     - `output_content`: Control what's included in response
-    - `output_bucket + output_key`: Automatically save results to storage
+    - `output_key`: Automatically save results to configured storage bucket
     - `stored_output`: Choose between primary storage or S3 for saved results
     
     **⚙️ Transcription Settings:**
@@ -1420,25 +1419,27 @@ async def create_transcription(
     temp_audio_path = None
     try:
         # Validate input parameters
+        file_provided = file is not None and file.filename is not None and file.filename.strip() != ""
         input_sources = sum([
-            file is not None,
-            bool(storage_bucket and storage_key),
+            file_provided,
+            bool(storage_key),
             bool(s3_presigned_url)
         ])
         
         if input_sources == 0:
-            raise HTTPException(400, "One input source required: file upload, storage object (storage_bucket+storage_key), or s3_presigned_url")
+            raise HTTPException(400, "One input source required: file upload, storage_key, or s3_presigned_url")
         elif input_sources > 1:
             raise HTTPException(400, "Only one input source allowed at a time")
         
-        # Validate output parameters
-        if output_bucket and not output_key:
-            # Auto-generate output key if bucket specified but key not provided
+        # Auto-generate output key if not provided (will use environment-configured bucket)
+        if output_key:
+            # User provided a custom key - we'll use the configured bucket
+            logger.info(f"Using custom output key: {output_key}")
+        elif output_key is not None:
+            # User explicitly wants to save but didn't provide key - auto-generate
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             output_key = f"transcriptions/{timestamp}_result.json"
             logger.info(f"Auto-generated output key: {output_key}")
-        elif output_key and not output_bucket:
-            raise HTTPException(400, "output_bucket required when output_key is provided")
         
         # Log ignored parameters for transparency
         ignored_params = []
@@ -1458,10 +1459,11 @@ async def create_transcription(
                 temp_audio_path = temp_file.name
                 shutil.copyfileobj(file.file, temp_file)
                 
-        elif storage_bucket and storage_key:
-            # Storage object download
-            logger.info(f"Processing storage object: {storage_bucket}/{storage_key}")
-            temp_audio_path = await download_from_r2(storage_bucket, storage_key)
+        elif storage_key:
+            # Storage object download from configured bucket
+            bucket = DEFAULT_UPLOAD_BUCKET
+            logger.info(f"Processing storage object: {bucket}/{storage_key}")
+            temp_audio_path = await download_from_r2(bucket, storage_key)
             
         elif s3_presigned_url:
             # Pre-signed S3 URL download
@@ -1499,15 +1501,16 @@ async def create_transcription(
             key_info = "user-specified"
         
         # Priority 2: Server storage (R2 or S3)
-        elif output_bucket and output_key:
+        elif output_key:
+            bucket = DEFAULT_RESULTS_BUCKET
             storage_url = await upload_result_to_storage(
                 result, 
-                output_bucket, 
+                bucket, 
                 output_key, 
                 use_r2=stored_output
             )
             service_name = "Primary Storage" if stored_output else "S3"
-            bucket_info = output_bucket
+            bucket_info = bucket
             key_info = output_key
         
         # Add storage info to result if upload occurred
