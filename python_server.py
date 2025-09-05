@@ -32,12 +32,13 @@ import torchaudio
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 import uvicorn
 from dotenv import load_dotenv
 import torch
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
+import httpx
 import io
 from urllib.parse import urlparse
 import requests
@@ -1158,6 +1159,33 @@ async def upload_result_to_storage(result: dict, bucket: str, key: str, use_r2: 
         service = "R2" if use_r2 else "S3"
         raise HTTPException(500, f"Unexpected error uploading to {service}: {str(e)}")
 
+async def upload_to_user_presigned_url(result: dict, presigned_url: str) -> str:
+    """Upload transcription result to user-provided pre-signed URL"""
+    import httpx
+    
+    try:
+        # Convert result to JSON
+        result_json = json.dumps(result, indent=2, ensure_ascii=False)
+        
+        # Upload using the pre-signed URL
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.put(
+                presigned_url,
+                content=result_json.encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            if response.status_code not in [200, 201]:
+                raise HTTPException(500, f"Failed to upload to user URL: HTTP {response.status_code}")
+        
+        logger.info(f"Successfully uploaded result to user-provided URL")
+        return presigned_url
+        
+    except httpx.RequestError as e:
+        raise HTTPException(500, f"Network error uploading to user URL: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, f"Failed to upload to user-provided URL: {str(e)}")
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize models and storage clients on startup"""
@@ -1199,28 +1227,33 @@ async def health_check():
 
 @app.post("/v1/uploads")
 async def upload_to_r2(
-    file: UploadFile = File(..., description="Audio file to upload to R2"),
-    bucket: str = Form(..., description="R2 bucket name"),
-    key: Optional[str] = Form(None, description="R2 object key (auto-generated if not provided)")
+    file: UploadFile = File(..., description="Audio file to upload"),
+    bucket: Optional[str] = Form(None, description="Storage bucket name (optional - uses default if not specified)"),
+    key: Optional[str] = Form(None, description="Object key (auto-generated if not provided)")
 ):
     """
-    Upload audio file directly to R2 bucket
+    Upload audio file directly to cloud storage
     
-    This endpoint uploads files directly to Cloudflare R2 storage and returns the 
-    R2 object reference that can be used later for transcription.
+    This endpoint uploads files directly to cloud storage and returns the 
+    object reference that can be used later for transcription.
     
     **Parameters:**
     - `file`: The audio file to upload
-    - `bucket`: Target R2 bucket name
+    - `bucket`: Optional storage bucket name (uses server default if not specified)
     - `key`: Optional custom object key (if not provided, generates timestamp-based key)
     
     **Returns:**
-    - R2 object details including bucket, key, and file info
+    - Storage object details including bucket, key, and file info
     """
     if not r2_client:
-        raise HTTPException(500, "R2 client not configured. Check R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY environment variables.")
+        raise HTTPException(500, "Cloud storage client not configured. Check storage credentials in server environment.")
     
     try:
+        # Use default bucket if not provided
+        if not bucket:
+            bucket = os.getenv('DEFAULT_UPLOAD_BUCKET', 'uploads')  # Default bucket name
+            logger.info(f"Using default bucket: {bucket}")
+        
         # Generate key if not provided
         if not key:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1231,7 +1264,7 @@ async def upload_to_r2(
         file_content = await file.read()
         file_size = len(file_content)
         
-        # Upload to R2
+        # Upload to storage
         r2_client.put_object(
             Bucket=bucket,
             Key=key,
@@ -1240,17 +1273,17 @@ async def upload_to_r2(
             Metadata={
                 'original_filename': file.filename or 'unknown',
                 'upload_timestamp': datetime.now().isoformat(),
-                'uploaded_by': 'morpheus-stt'
+                'uploaded_by': 'whisper-server'
             }
         )
         
-        logger.info(f"Successfully uploaded file to R2: s3://{bucket}/{key} ({file_size} bytes)")
+        logger.info(f"Successfully uploaded file to storage: {bucket}/{key} ({file_size} bytes)")
         
         return {
             "status": "success",
-            "message": "File uploaded to R2 successfully",
-            "r2_bucket": bucket,
-            "r2_key": key,
+            "message": "File uploaded successfully",
+            "bucket": bucket,
+            "key": key,
             "file_size": file_size,
             "original_filename": file.filename,
             "content_type": file.content_type,
@@ -1261,117 +1294,140 @@ async def upload_to_r2(
     except ClientError as e:
         error_code = e.response['Error']['Code']
         if error_code == 'NoSuchBucket':
-            raise HTTPException(404, f"R2 bucket not found: {bucket}")
+            raise HTTPException(404, f"Storage bucket not found: {bucket}")
         elif error_code == 'AccessDenied':
-            raise HTTPException(403, f"Access denied to R2 bucket: {bucket}")
+            raise HTTPException(403, f"Access denied to storage bucket: {bucket}")
         else:
-            raise HTTPException(500, f"R2 upload failed: {str(e)}")
+            raise HTTPException(500, f"Storage upload failed: {str(e)}")
     except Exception as e:
-        logger.error(f"Upload to R2 failed: {e}")
-        raise HTTPException(500, f"Failed to upload file to R2: {str(e)}")
+        logger.error(f"Upload to storage failed: {e}")
+        raise HTTPException(500, f"Failed to upload file: {str(e)}")
+
+@app.post("/v1/downloads")
+async def download_from_storage(
+    bucket: str = Form(..., description="Storage bucket name"),
+    key: str = Form(..., description="Object key/path of the file to download")
+):
+    """
+    Download file from cloud storage
+    
+    This endpoint allows you to retrieve files stored in cloud storage.
+    
+    **Parameters:**
+    - `bucket`: Storage bucket name
+    - `key`: Object key/path of the file to download
+    
+    **Returns:**
+    - The requested file as a downloadable response
+    """
+    if not r2_client:
+        raise HTTPException(500, "Cloud storage client not configured")
+    
+    try:
+        # Get the object from storage
+        response = r2_client.get_object(Bucket=bucket, Key=key)
+        
+        # Get file content and metadata
+        file_content = response['Body'].read()
+        content_type = response.get('ContentType', 'application/octet-stream')
+        
+        # Extract filename from key
+        filename = key.split('/')[-1] if '/' in key else key
+        
+        return Response(
+            content=file_content,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}"
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to download file {bucket}/{key}: {e}")
+        raise HTTPException(404, f"File not found: {str(e)}")
 
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
-    # Input source parameters - ONE of these is required
-    file: Optional[UploadFile] = File(None, description="Audio file to transcribe (direct upload)"),
-    r2_bucket: Optional[str] = Form(None, description="R2 bucket name for existing file"),
-    r2_key: Optional[str] = Form(None, description="R2 object key for existing file"),
-    s3_presigned_url: Optional[str] = Form(None, description="Pre-signed S3 URL to download file from"),
+    # === FILE INPUT SECTION ===
+    file: Optional[UploadFile] = File(None, description="Audio file to upload and transcribe"),
+    storage_bucket: Optional[str] = Form(None, description="Existing file bucket name"), 
+    storage_key: Optional[str] = Form(None, description="Existing file object key"),
+    s3_presigned_url: Optional[str] = Form(None, description="Pre-signed S3/storage URL to download file from"),
     
-    # Output destination parameters (optional)
-    output_bucket: Optional[str] = Form(None, description="Bucket to save transcription results"),
-    output_key: Optional[str] = Form(None, description="Object key for saved results (auto-generated if not provided)"),
-    output_use_r2: bool = Form(False, description="Use R2 for output (true) or standard S3 (false)"),
-    
-    # Core parameters
-    enable_diarization: bool = Form(True, description="Enable speaker diarization"),
+    # === TRANSCRIPTION OUTPUT SECTION ===
     response_format: str = Form("json", description="Response format: json, verbose_json, text, srt, vtt"),
+    output_content: str = Form("both", description="Include both JSON and plain text in response"),
+    stored_output: bool = Form(False, description="Save to cloud storage? True=R2 bucket, False=S3 bucket"),
+    output_bucket: Optional[str] = Form(None, description="Storage bucket name (for server storage)"),
+    output_key: Optional[str] = Form(None, description="Custom storage object key (auto-generated if not provided)"),
+    upload_presigned_url: Optional[str] = Form(None, description="Pre-signed upload URL to user's own S3 bucket (overrides server storage)"),
+    
+    # === TRANSCRIPTION SETTINGS SECTION ===
     language: str = Form("en", description="Language code (e.g., 'en', 'es', 'fr', 'de')"),
-    model: str = Form("large-v2", description="[IGNORED] Whisper model to use: tiny, base, small, medium, large, large-v2, large-v3 - Currently always uses large-v2"),
-    
-    # OpenAI API compliance parameters
-    prompt: str = Form("", description="Optional text prompt to provide context or guide the transcription"),
-    temperature: float = Form(0.0, description="[IGNORED] Sampling temperature (0.0-1.0, higher values increase randomness) - Limited WhisperX support"),
+    enable_diarization: bool = Form(True, description="Enable speaker diarization"),
     timestamp_granularities: str = Form("segment", description="Timestamp granularity: 'segment' or 'word' (comma-separated for both)"),
-    output_content: str = Form("both", description="Content to include in output: 'both', 'text_only', 'timestamps_only', 'metadata_only'"),
+    prompt: str = Form("", description="Optional text prompt to provide context or guide the transcription (e.g., proper names, technical terms)"),
     
-    # Processing parameters
+    # === FINE-TUNING SETTINGS SECTION ===
     batch_size: int = Form(8, description="Batch size for processing (higher = faster but more memory)"),
-    
-    # Diarization parameters (only used if enable_diarization=True)
     clustering_threshold: float = Form(0.7, description="Speaker clustering threshold (0.5-1.0, lower = more speakers)"),
     segmentation_threshold: float = Form(0.45, description="Voice activity detection threshold (0.1-0.9)"),
     min_speaker_duration: float = Form(3.0, description="Minimum speaking time per speaker (seconds)"),
     speaker_confidence_threshold: float = Form(0.6, description="Minimum confidence for speaker assignment (0.1-1.0)"),
     speaker_smoothing_enabled: bool = Form(True, description="Enable speaker transition smoothing"),
     min_switch_duration: float = Form(2.0, description="Minimum time between speaker switches (seconds)"),
-    vad_validation_enabled: bool = Form(False, description="Enable Voice Activity Detection validation (experimental)")
+    vad_validation_enabled: bool = Form(False, description="Enable Voice Activity Detection validation (experimental)"),
+    
+    # === COMPATIBILITY PARAMETERS (accepted but may be ignored) ===
+    model: str = Form("large-v2", description="[IGNORED] Whisper model specification - server always uses optimized model"),
+    temperature: float = Form(0.0, description="[IGNORED] Sampling temperature - not supported by current engine")
 ):
     """
-    **Transcribe audio with advanced diarization and multi-cloud storage support**
+    **Advanced Audio Transcription with Speaker Identification**
     
-    This endpoint provides comprehensive audio transcription with speaker diarization,
-    supporting multiple input sources and automatic result export to cloud storage.
+    Upload audio files and receive accurate transcriptions with speaker diarization,
+    supporting multiple input sources and automatic result export.
     
-    **Input Sources (choose ONE):**
-    - `file`: Direct file upload (traditional method)
-    - `r2_bucket + r2_key`: Cloudflare R2 object reference
-    - `s3_presigned_url`: Pre-signed S3 URL for secure access
+    **📁 File Input Options (choose ONE):**
+    - `file`: Direct file upload (recommended for most use cases)
+    - `storage_bucket + storage_key`: Reference to existing file in storage 
+    - `s3_presigned_url`: Pre-signed URL for secure file access
     
-    **Output Destinations (optional):**
-    - `output_bucket + output_key`: Save results to R2/S3 bucket
-    - `output_use_r2`: Use R2 (true) or standard S3 (false) for output
+    **📄 Transcription Output:**
+    - `response_format`: Choose output format (JSON, SRT, VTT, plain text)
+    - `output_content`: Control what's included in response
+    - `output_bucket + output_key`: Automatically save results to storage
+    - `stored_output`: Choose between primary storage or S3 for saved results
     
-    **Core Features:**
-    - Multi-language transcription support
+    **⚙️ Transcription Settings:**
+    - Multi-language support with automatic detection
     - Advanced speaker diarization with confidence scoring
-    - Multiple output formats (JSON, SRT, VTT, plain text)
-    - GPU-accelerated processing
-    - Multi-cloud storage integration (R2, S3)
-    - Automatic result export
-    - Pre-signed URL support for secure access
+    - Flexible timestamp granularity (segment, word, or both)
+    - Context prompts for improved accuracy with technical terms
     
-    **Response Formats:**
-    - `json`: Standard JSON with segments and words
-    - `verbose_json`: Detailed JSON with speaker confidence and metadata 
-    - `text`: Plain text transcription only
-    - `srt`: SubRip subtitle format with timestamps
-    - `vtt`: WebVTT subtitle format
+    **🎛️ Fine-Tuning Settings:**
+    - Speaker recognition parameters for optimal accuracy
+    - GPU batch processing optimization
+    - Voice activity detection controls
+    - Speaker transition smoothing options
     
-    **OpenAI API Compatibility:**
-    - `prompt`: Optional text to guide the transcription (context, spelling, etc.)
-    - `timestamp_granularities`: Control timestamp detail ('segment', 'word', or 'segment,word')
-    - `output_content`: Control response content ('all', 'text_only', 'metadata_only')
-    
-    **Diarization Parameters:**
-    - `clustering_threshold`: Controls speaker separation (lower = more speakers detected)
-    - `segmentation_threshold`: Voice activity sensitivity (lower = more sensitive)
-    - `speaker_confidence_threshold`: Quality filter for speaker assignments
-    - `min_speaker_duration`: Filters out speakers with brief speaking time
-    
-    **Cloud Storage Benefits:**
-    - Zero bandwidth costs with direct R2 uploads
-    - Support for multi-TB file processing
-    - Automatic result archiving
-    - Enterprise-grade reliability
-    
-    **Performance Tips:**
-    - Use higher `batch_size` for faster processing (requires more GPU memory)
-    - Use R2 for large files (>500MB) to avoid upload timeouts
-    - Pre-signed URLs enable client-side upload without exposing credentials
-    - Result export enables workflow automation
+    **🚀 Performance Features:**
+    - GPU-accelerated processing pipeline
+    - Automatic result archiving to cloud storage
+    - Enterprise-grade reliability and cleanup
+    - Memory-efficient processing for large files
     """
     temp_audio_path = None
     try:
         # Validate input parameters
         input_sources = sum([
             file is not None,
-            bool(r2_bucket and r2_key),
+            bool(storage_bucket and storage_key),
             bool(s3_presigned_url)
         ])
         
         if input_sources == 0:
-            raise HTTPException(400, "One input source required: file upload, R2 object (r2_bucket+r2_key), or s3_presigned_url")
+            raise HTTPException(400, "One input source required: file upload, storage object (storage_bucket+storage_key), or s3_presigned_url")
         elif input_sources > 1:
             raise HTTPException(400, "Only one input source allowed at a time")
         
@@ -1402,14 +1458,14 @@ async def create_transcription(
                 temp_audio_path = temp_file.name
                 shutil.copyfileobj(file.file, temp_file)
                 
-        elif r2_bucket and r2_key:
-            # R2 object download
-            logger.info(f"Processing R2 object: s3://{r2_bucket}/{r2_key}")
-            temp_audio_path = await download_from_r2(r2_bucket, r2_key)
+        elif storage_bucket and storage_key:
+            # Storage object download
+            logger.info(f"Processing storage object: {storage_bucket}/{storage_key}")
+            temp_audio_path = await download_from_r2(storage_bucket, storage_key)
             
         elif s3_presigned_url:
             # Pre-signed S3 URL download
-            logger.info(f"Processing pre-signed S3 URL: {s3_presigned_url[:50]}...")
+            logger.info(f"Processing pre-signed URL: {s3_presigned_url[:50]}...")
             temp_audio_path = await download_from_s3_presigned(s3_presigned_url)
         
         # Process transcription
@@ -1434,13 +1490,25 @@ async def create_transcription(
         
         # Handle output to storage if requested
         storage_url = None
-        if output_bucket and output_key:
+        
+        # Priority 1: User-provided upload URL (saves to user's bucket)
+        if upload_presigned_url:
+            storage_url = await upload_to_user_presigned_url(result, upload_presigned_url)
+            service_name = "User S3 Bucket"
+            bucket_info = upload_presigned_url
+            key_info = "user-specified"
+        
+        # Priority 2: Server storage (R2 or S3)
+        elif output_bucket and output_key:
             storage_url = await upload_result_to_storage(
                 result, 
                 output_bucket, 
                 output_key, 
-                use_r2=output_use_r2
+                use_r2=stored_output
             )
+            service_name = "Primary Storage" if stored_output else "S3"
+            bucket_info = output_bucket
+            key_info = output_key
         
         # Add storage info to result if upload occurred
         if storage_url:
@@ -1449,9 +1517,9 @@ async def create_transcription(
                 result["storage_info"] = {
                     "uploaded": True,
                     "storage_url": storage_url,
-                    "bucket": output_bucket,
-                    "key": output_key,
-                    "service": "R2" if output_use_r2 else "S3"
+                    "bucket": bucket_info,
+                    "key": key_info,
+                    "service": service_name
                 }
         
         if response_format == "json":
@@ -1494,7 +1562,7 @@ async def create_transcription(
         logger.error(f"Transcription request failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Cleanup temporary files (from any source: direct upload, R2, or S3)
+        # Cleanup temporary files (from any source: direct upload, storage, or S3)
         if temp_audio_path and os.path.exists(temp_audio_path):
             try:
                 os.unlink(temp_audio_path)

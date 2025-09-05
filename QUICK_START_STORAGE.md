@@ -8,9 +8,9 @@ The `.env` file is pre-configured with R2 credentials from your cloudflareplan.m
 
 ```bash
 # Already set in .env:
-R2_ENDPOINT=https://b0cf22bf446035f86eecce8c6f81d0a1.r2.cloudflarestorage.com
-R2_ACCESS_KEY_ID=aa20f7a8635123de669b02bc1b0c59d7
-R2_SECRET_ACCESS_KEY=0abd513e3d56762dcf87799157d9e58ad4fadb8178f0a08ed2c2b8a29a3d5330
+R2_ENDPOINT=
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=
 ```
 
 ⚠️ **Verify these credentials are correct for your use case**
