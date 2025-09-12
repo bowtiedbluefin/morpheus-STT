@@ -29,7 +29,7 @@ import numpy as np
 
 import whisperx
 import torchaudio
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -1351,8 +1351,10 @@ async def download_from_storage(
 
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
+    request: Request,
+    
     # === FILE INPUT SECTION ===
-    file: UploadFile = File(..., description="Audio file to upload and transcribe"),
+    file: Optional[UploadFile] = File(None, description="Audio file to upload and transcribe"),
     
     # === FILE REFERENCE OPTIONS ===
     storage_key: Optional[str] = Form(None, description="Storage object key for existing file"),
@@ -1361,7 +1363,7 @@ async def create_transcription(
     # === TRANSCRIPTION OUTPUT SECTION ===
     response_format: str = Form("json", description="Response format: json, verbose_json, text, srt, vtt"),
     output_content: str = Form("both", description="Include both JSON and plain text in response"),
-    stored_output: bool = Form(False, description="Storage type - True: Primary storage, False: S3 bucket"),
+    stored_output: bool = Form(False, description="Enable result storage - True: Save to storage, False: API response only"),
     output_key: Optional[str] = Form(None, description="Custom storage object key (auto-generated if not provided)"),
     upload_presigned_url: Optional[str] = Form(None, description="Pre-signed upload URL to save results to your own S3 bucket (overrides server storage)"),
     
@@ -1388,15 +1390,24 @@ async def create_transcription(
     supporting multiple input sources and automatic result export.
     
     **📁 File Input Options (choose ONE):**
-    - `file`: Direct file upload (recommended for most use cases)
-    - `storage_key`: Reference to existing file in configured storage bucket
+    - `file`: Direct file upload (optional - recommended for most use cases)
+    - `storage_key`: Reference to existing file in configured storage bucket  
     - `s3_presigned_url`: Pre-signed URL for secure file access
+    
+    **Note**: Exactly one input source must be provided. The API will fail if none are provided or if multiple are provided.
     
     **📄 Transcription Output:**
     - `response_format`: Choose output format (JSON, SRT, VTT, plain text)
     - `output_content`: Control what's included in response
-    - `output_key`: Automatically save results to configured storage bucket
-    - `stored_output`: Choose between primary storage or S3 for saved results
+    - `stored_output`: Enable/disable result storage (false = API response only)
+    - `upload_presigned_url`: Upload to your own S3 bucket (overrides server storage)
+    - `output_key`: Custom storage object key (auto-generated if not provided)
+    
+    **Output Logic:**
+    - If `stored_output` is `false`: Results returned in API response only
+    - If `stored_output` is `true`:
+      - If `upload_presigned_url` is provided: Upload to user's S3 bucket
+      - Otherwise: Upload to server's downloads bucket
     
     **⚙️ Transcription Settings:**
     - Multi-language support with automatic detection
@@ -1431,22 +1442,27 @@ async def create_transcription(
         elif input_sources > 1:
             raise HTTPException(400, "Only one input source allowed at a time")
         
-        # Auto-generate output key if not provided (will use environment-configured bucket)
-        if output_key:
-            # User provided a custom key - we'll use the configured bucket
-            logger.info(f"Using custom output key: {output_key}")
-        elif output_key is not None:
-            # User explicitly wants to save but didn't provide key - auto-generate
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            output_key = f"transcriptions/{timestamp}_result.json"
-            logger.info(f"Auto-generated output key: {output_key}")
+        # Output key handling is now done in the storage logic based on stored_output parameter
         
-        # Log ignored parameters for transparency
+        # Handle legacy parameters if provided (model, temperature) - these are ignored but logged
+        form_data = await request.form()
         ignored_params = []
-        if model != "large-v2":
-            ignored_params.append(f"model={model} (using large-v2)")
-        if temperature != 0.0:
-            ignored_params.append(f"temperature={temperature} (using 0.0)")
+        
+        # Check for model parameter (ignored)
+        if "model" in form_data:
+            model_value = form_data.get("model")
+            if model_value != "large-v2":
+                ignored_params.append(f"model={model_value} (using large-v2)")
+        
+        # Check for temperature parameter (ignored)
+        if "temperature" in form_data:
+            temperature_value = form_data.get("temperature")
+            try:
+                temp_float = float(temperature_value)
+                if temp_float != 0.0:
+                    ignored_params.append(f"temperature={temperature_value} (using 0.0)")
+            except (ValueError, TypeError):
+                ignored_params.append(f"temperature={temperature_value} (invalid, using 0.0)")
         
         if ignored_params:
             logger.info(f"ℹ️  Ignored parameters in this request: {', '.join(ignored_params)}")
@@ -1475,10 +1491,10 @@ async def create_transcription(
             temp_audio_path, 
             enable_diarization=enable_diarization,
             language=language,
-            model=model,
+            model="large-v2",  # Always use large-v2 (ignored parameters handled above)
             batch_size=batch_size,
             prompt=prompt,
-            temperature=temperature,
+            temperature=0.0,  # Always use 0.0 (ignored parameters handled above)
             timestamp_granularities=timestamp_granularities,
             output_content=output_content,
             clustering_threshold=clustering_threshold,
@@ -1490,28 +1506,40 @@ async def create_transcription(
             vad_validation_enabled=vad_validation_enabled
         )
         
-        # Handle output to storage if requested
+        # Handle output to storage based on user's requirements:
+        # IF stored_output IS TRUE, THEN
+        #   IF upload_presigned_URL IS TRUE, THEN output to upload_presigned_URL
+        #   ELSE output to downloads bucket (defined in /downloads endpoint)
+        # ELSE provide response within API call
         storage_url = None
         
-        # Priority 1: User-provided upload URL (saves to user's bucket)
-        if upload_presigned_url:
-            storage_url = await upload_to_user_presigned_url(result, upload_presigned_url)
-            service_name = "User S3 Bucket"
-            bucket_info = upload_presigned_url
-            key_info = "user-specified"
-        
-        # Priority 2: Server storage (R2 or S3)
-        elif output_key:
-            bucket = DEFAULT_RESULTS_BUCKET
-            storage_url = await upload_result_to_storage(
-                result, 
-                bucket, 
-                output_key, 
-                use_r2=stored_output
-            )
-            service_name = "Primary Storage" if stored_output else "S3"
-            bucket_info = bucket
-            key_info = output_key
+        if stored_output:
+            # User wants stored output
+            if upload_presigned_url:
+                # Priority 1: Upload to user's pre-signed URL
+                storage_url = await upload_to_user_presigned_url(result, upload_presigned_url)
+                service_name = "User S3 Bucket"
+                bucket_info = upload_presigned_url
+                key_info = "user-specified"
+            else:
+                # Priority 2: Upload to downloads bucket (default server storage)
+                if not output_key:
+                    # Auto-generate output key if not provided
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    output_key = f"transcriptions/{timestamp}_result.json"
+                    logger.info(f"Auto-generated output key: {output_key}")
+                
+                bucket = DEFAULT_RESULTS_BUCKET
+                storage_url = await upload_result_to_storage(
+                    result, 
+                    bucket, 
+                    output_key, 
+                    use_r2=True  # Use primary storage (downloads bucket)
+                )
+                service_name = "Downloads Bucket"
+                bucket_info = bucket
+                key_info = output_key
+        # If stored_output is False, don't store anything - just return API response
         
         # Add storage info to result if upload occurred
         if storage_url:

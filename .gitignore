@@ -67,7 +67,7 @@ celerybeat-schedule
 
 # Environments
 .env
-working_gpu.env
+test.env
 .venv
 env/
 venv/

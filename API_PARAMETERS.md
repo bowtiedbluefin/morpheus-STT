@@ -2,18 +2,34 @@
 
 ## Complete List of Available Parameters
 
-### Required Parameters
+### Input Source Parameters (choose ONE)
 | Parameter | Type | Description | Example |
 |-----------|------|-------------|---------|
-| `file` | File | Audio file to transcribe | `audio.wav` |
+| `file` | File | Audio file to upload and transcribe | `audio.wav` |
+| `storage_key` | String | Storage object key for existing file | "uploads/audio_123.wav" |
+| `s3_presigned_url` | String | Pre-signed URL to download audio file from S3 | "https://bucket.s3.amazonaws.com/file?..." |
+
+**Note**: Exactly one of these input sources must be provided. The API will fail if none are provided or if multiple are provided.
 
 ### Core Parameters
 | Parameter | Type | Default | Description | Example |
 |-----------|------|---------|-------------|---------|
-| `model` | String | "whisper-1" | Model identifier (ignored - always uses large-v3) | "whisper-1", "gpt-4" |
-| `language` | String | None (auto-detect) | Language code (ISO-639-1) | "en", "es", "fr" |
+| `language` | String | "en" | Language code (ISO-639-1) | "en", "es", "fr" |
 | `response_format` | String | "json" | Output format | "json", "verbose_json", "text", "srt", "vtt" |
 | `timestamp_granularities[]` | Array | ["segment"] | Timestamp detail level | ["segment"], ["word"], ["segment", "word"] |
+
+### Output Storage Parameters
+| Parameter | Type | Default | Description | Example |
+|-----------|------|---------|-------------|---------|
+| `stored_output` | Boolean | false | Enable result storage | true, false |
+| `upload_presigned_url` | String | None | Pre-signed upload URL to save results to your own S3 bucket | "https://bucket.s3.amazonaws.com/upload?..." |
+| `output_key` | String | None | Custom storage object key (auto-generated if not provided) | "my-results/transcript.json" |
+
+**Output Logic**:
+- If `stored_output` is `false`: Results returned in API response only
+- If `stored_output` is `true`:
+  - If `upload_presigned_url` is provided: Upload to user's S3 bucket
+  - Otherwise: Upload to server's downloads bucket
 
 ### WhisperX Enhanced Parameters
 | Parameter | Type | Default | Description | Example |
@@ -27,9 +43,11 @@
 ### Legacy Parameters (Present but NOT used by WhisperX)
 | Parameter | Type | Default | Description | Status |
 |-----------|------|---------|-------------|--------|
-| `prompt` | String | None | Initial prompt text | ⚠️ Accepted but ignored |
-| `temperature` | Float | 0.0 | Sampling temperature | ⚠️ Accepted but ignored |
+| `model` | String | "large-v2" | Model identifier | ⚠️ Silently ignored if provided (always uses large-v3) |
+| `temperature` | Float | 0.0 | Sampling temperature | ⚠️ Silently ignored if provided |
 | `enable_profanity_filter` | Boolean | false | Profanity filtering | ⚠️ Accepted but not implemented |
+
+**Note**: `model` and `temperature` parameters are not shown in the Swagger UI but are handled gracefully if sent by legacy clients.
 
 ## Parameter Details
 
