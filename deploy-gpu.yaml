@@ -3,7 +3,7 @@ version: "2.0"
 
 services:
   whisper-api:
-    image: kylecohen01/whisper-transcription-api:2.1
+    image: kylecohen01/whisper-transcription-api:4.5
     expose:
       - port: 3333
         as: 80
@@ -38,18 +38,18 @@ services:
       
       # Core WhisperX Configuration
       - WHISPERX_COMPUTE_TYPE=float32
-      - WHISPERX_BATCH_SIZE=8
-      - WHISPERX_CHAR_ALIGN=true
+      - WHISPERX_BATCH_SIZE=16
+      - WHISPERX_CHAR_ALIGN=false
       - MAX_CONCURRENT_REQUESTS=4
       - MEMORY_PER_REQUEST_GB=6.0
-      - WHISPERX_CHUNK_LENGTH=15
+      - WHISPERX_CHUNK_LENGTH=30
       - VAD_ONSET=0.500
       - VAD_OFFSET=0.200
       - ALIGN_MODEL=WAV2VEC2_ASR_LARGE_LV60K_960H
       - INTERPOLATE_METHOD=linear
-      - SEGMENT_RESOLUTION=sentence
+      - SEGMENT_RESOLUTION=word
       - ENABLE_REQUEST_QUEUING=true
-      - QUEUE_TIMEOUT=300
+      - QUEUE_TIMEOUT=600
 
 profiles:
   compute:

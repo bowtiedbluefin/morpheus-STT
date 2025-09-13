@@ -47,15 +47,15 @@ RUN apt-get update && apt-get install -y \
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
  && rm -rf /var/lib/apt/lists/*
 
-# Enhanced WhisperX Configuration (Customer Feedback Optimized)
+# Enhanced WhisperX Configuration (Performance Optimized)
 ENV WHISPERX_COMPUTE_TYPE=float32
-ENV WHISPERX_BATCH_SIZE=8
-ENV WHISPERX_CHAR_ALIGN=true
+ENV WHISPERX_BATCH_SIZE=16
+ENV WHISPERX_CHAR_ALIGN=false
 ENV MAX_CONCURRENT_REQUESTS=3
 ENV MEMORY_PER_REQUEST_GB=6.0
 
 # Enhanced VAD Configuration (addressing customer feedback)
-ENV WHISPERX_CHUNK_LENGTH=15
+ENV WHISPERX_CHUNK_LENGTH=30
 ENV VAD_ONSET=0.35
 ENV VAD_OFFSET=0.25
 ENV MIN_SEGMENT_LENGTH=0.5
@@ -74,9 +74,9 @@ ENV VAD_VALIDATION_ENABLED=false
 # WhisperX Core Settings
 ENV ALIGN_MODEL=WAV2VEC2_ASR_LARGE_LV60K_960H
 ENV INTERPOLATE_METHOD=linear
-ENV SEGMENT_RESOLUTION=sentence
+ENV SEGMENT_RESOLUTION=word
 ENV ENABLE_REQUEST_QUEUING=true
-ENV QUEUE_TIMEOUT=300
+ENV QUEUE_TIMEOUT=600
 
 # Text Processing Enhancements
 ENV TEXT_NORMALIZATION_MODE=enhanced

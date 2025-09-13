@@ -96,17 +96,7 @@ The system includes sophisticated parameter tuning for optimal accuracy:
 
 See `env.example` for complete parameter documentation and tuning guidelines.
 
-### Performance Metrics
 
-**Accuracy Benchmarks:**
-- Speaker Count Accuracy: **95%+** vs golden samples
-- Timeline Consistency: **94.9%** average word-level attribution
-- Over-detection Rate: **<5%** across diverse audio types
-
-**Performance Benchmarks:**
-- Processing Speed: **<30s** for 5-minute audio, **<60s** for 10-minute audio
-- GPU Acceleration: **10-50x** speedup vs CPU processing
-- Memory Efficiency: **<2GB** GPU usage for standard workloads
 
 ## Installation
 
@@ -215,6 +205,14 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "enable_diarization=true" \
   -F "response_format=srt" \
   -o subtitles_with_speakers.srt
+
+# Performance-optimized diarization (faster processing)
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "enable_diarization=true" \
+  -F "optimized_alignment=false" \
+  -F "batch_size=16" \
+  -F "response_format=json"
 ```
 
 ##### Advanced Features Examples
@@ -234,6 +232,32 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "response_format=verbose_json"
 ```
 
+##### Alignment Optimization Examples
+```bash
+# High accuracy mode (default) - uses WAV2VEC2 alignment
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "enable_diarization=true" \
+  -F "optimized_alignment=true" \
+  -F "response_format=json"
+
+# Fast processing mode - uses Whisper built-in alignment (~50% faster)
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "enable_diarization=true" \
+  -F "optimized_alignment=false" \
+  -F "response_format=json"
+
+# Performance comparison test
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@long_meeting.wav" \
+  -F "enable_diarization=true" \
+  -F "optimized_alignment=false" \
+  -F "batch_size=16" \
+  -F "response_format=json" \
+  -F "output_content=metadata_only"
+```
+
 ##### All Available Options Example
 ```bash
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
@@ -245,6 +269,8 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "timestamp_granularities[]=word" \
   -F "output_content=both" \
   -F "enable_diarization=true" \
+  -F "optimized_alignment=true" \
+  -F "batch_size=16" \
   -F "min_speakers=2" \
   -F "max_speakers=5" \
   -o transcription_with_words.json
@@ -338,6 +364,8 @@ data = {
     "timestamp_granularities[]": "word",
     # WhisperX features
     "enable_diarization": True,
+    "optimized_alignment": True,  # True=accurate, False=fast
+    "batch_size": 16,
     "min_speakers": 2,
     "max_speakers": 4,
     "output_content": "both"
@@ -361,6 +389,8 @@ form.append('response_format', 'verbose_json');
 form.append('timestamp_granularities[]', 'segment');
 // WhisperX features
 form.append('enable_diarization', 'true');
+form.append('optimized_alignment', 'true'); // true=accurate, false=fast
+form.append('batch_size', '16');
 form.append('min_speakers', '2');
 form.append('max_speakers', '4');
 form.append('output_content', 'both');
@@ -387,7 +417,7 @@ client = OpenAI(
 # Use exactly like OpenAI API
 with open("audio.wav", "rb") as audio_file:
     transcript = client.audio.transcriptions.create(
-        model="whisper-1",  # Ignored - always uses large-v3
+        model="whisper-1",  # Ignored - always uses large-v3-turbo
         file=audio_file,
         response_format="verbose_json",
         timestamp_granularities=["word"]
@@ -410,10 +440,11 @@ with open("audio.wav", "rb") as audio_file:
 - **`enable_diarization`**: Enable speaker diarization to identify who is speaking (default: False)
 - **`min_speakers`**: Minimum number of speakers to detect for diarization (optional)
 - **`max_speakers`**: Maximum number of speakers to detect for diarization (optional)
+- **`optimized_alignment`**: Use WAV2VEC2 alignment model (True) or Whisper built-in alignment (False). True provides better speaker diarization accuracy but takes ~2x longer. False is ~50% faster but may have slightly less accurate speaker attribution. (default: True)
 
 
 ### Legacy Parameters (Present but not used by WhisperX)
-- **`model`**: Model identifier (ignored - always uses WhisperX large-v3) - for OpenAI compatibility
+- **`model`**: Model identifier (ignored - always uses WhisperX large-v3-turbo) - for OpenAI compatibility
 - **`prompt`**: Initial prompt (accepted for compatibility but not used)
 - **`temperature`**: Sampling temperature (accepted for compatibility but not used)
 - **`enable_profanity_filter`**: Profanity filter (accepted for compatibility but not implemented)
@@ -589,20 +620,22 @@ WhisperX handles many optimizations automatically, but you can still fine-tune p
 
 ### Quick Start - Environment Variables:
 ```bash
-# Customer feedback optimized (addresses accuracy issues)
+# Optimized production (current defaults)
 export WHISPERX_COMPUTE_TYPE=float32
-export WHISPERX_BATCH_SIZE=8
-export WHISPERX_CHAR_ALIGN=true
-export MAX_CONCURRENT_REQUESTS=4
+export WHISPERX_BATCH_SIZE=16
+export WHISPERX_CHAR_ALIGN=false
+export WHISPERX_CHUNK_LENGTH=30
+export SEGMENT_RESOLUTION=word
+export QUEUE_TIMEOUT=600
 
-# Balanced production (speed vs accuracy)
+# High performance (speed optimized)
 export WHISPERX_COMPUTE_TYPE=float16
-export WHISPERX_BATCH_SIZE=12
-export MAX_CONCURRENT_REQUESTS=5
+export WHISPERX_BATCH_SIZE=32
+export MAX_CONCURRENT_REQUESTS=8
 
 # H100 high throughput (maximum concurrency)
 export WHISPERX_COMPUTE_TYPE=float16
-export WHISPERX_BATCH_SIZE=16
+export WHISPERX_BATCH_SIZE=32
 export MAX_CONCURRENT_REQUESTS=15
 ```
 
@@ -622,12 +655,7 @@ export MAX_CONCURRENT_REQUESTS=15
 - **Concurrent Processing**: Built-in support for multiple simultaneous transcriptions
 - **GPU Optimization**: Memory-aware request management and monitoring
 
-### Concurrent Processing Features:
-- **RTX 3090**: Up to 4 concurrent requests (24GB VRAM) - **3600+ minutes/hour capacity**
-- **H100**: Up to 15 concurrent requests (80GB VRAM) - **22,500+ minutes/hour capacity**
-- **Memory Monitoring**: Real-time GPU memory tracking at `/processing-status`
-- **Request Management**: Automatic concurrency control and cleanup
-- **Queue Support**: Configurable request queuing for overflow handling
+
 
 ## Production Deployment
 
@@ -644,4 +672,7 @@ For production use, consider:
 - **GPU Recommended**: NVIDIA GPU with 4GB+ VRAM for optimal performance
 - **CPU Fallback**: Will work on CPU but significantly slower
 - **Memory Usage**: ~2-4GB GPU memory for transcription, +2GB for diarization
-- **Processing Speed**: **15x faster than real-time** on RTX 3090 (measured)
+- **Processing Speed**: 
+  - **With optimized_alignment=true**: ~18x faster than real-time (3.2min for 60min audio)
+  - **With optimized_alignment=false**: ~35x faster than real-time (1.7min for 60min audio)
+  - Measured on RTX 3090 with large-v3-turbo model

@@ -136,7 +136,11 @@ class WhisperXDiarizationServer:
         # VAD validation (disabled by default - too aggressive)
         self.vad_validation_enabled = os.getenv("VAD_VALIDATION_ENABLED", "false").lower() == "true"
         # WhisperX batch size optimization
-        self.batch_size = int(os.getenv("WHISPERX_BATCH_SIZE", "8"))
+        self.batch_size = int(os.getenv("WHISPERX_BATCH_SIZE", "16"))
+        
+        # OPTIMIZATION: Cache preprocessed audio to avoid redundant processing
+        self.cached_preprocessed_audio = None
+        self.cached_audio_path = None
         
         logger.info(f"🚀 WhisperX Diarization Server with Storage Integration")
         logger.info(f"Device: {self.device}")
@@ -156,7 +160,7 @@ class WhisperXDiarizationServer:
             # Load transcription model
             logger.info("Loading WhisperX transcription model...")
             self.transcription_model = whisperx.load_model(
-                "large-v2",
+                "large-v3-turbo",  # Performance optimized model
                 device=self.device,
                 compute_type=self.compute_type,
                 language="en"
@@ -236,24 +240,56 @@ class WhisperXDiarizationServer:
                 confidence = min(0.95, 0.6 + (duration * 0.05))  # Simulate realistic confidence
                 segment_confidences[segment_id] = confidence
             
-            # Assign speakers to words manually with confidence filtering
+            # Assign speakers manually with confidence filtering
+            # Handle both word-level (with alignment) and segment-level (without alignment) modes
             for segment in transcription_result['segments']:
-                if 'words' not in segment:
-                    continue
+                segment_start = segment.get('start', 0)
+                segment_end = segment.get('end', 0)
+                
+                if 'words' in segment:
+                    # Word-level assignment (when alignment was used)
+                    for word in segment['words']:
+                        word_start = word.get('start', 0)
+                        word_end = word.get('end', 0)
+                        
+                        # Find best matching speaker with confidence check
+                        best_speaker = None
+                        max_overlap = 0
+                        best_confidence = 0
+                        
+                        for spk_seg in speaker_segments:
+                            # Calculate overlap
+                            overlap_start = max(word_start, spk_seg['start'])
+                            overlap_end = min(word_end, spk_seg['end'])
+                            overlap = max(0, overlap_end - overlap_start)
+                            
+                            if overlap > max_overlap:
+                                confidence = segment_confidences.get(spk_seg['segment_id'], 0.5)
+                                
+                                # Apply speaker confidence threshold
+                                if confidence >= speaker_confidence_threshold:
+                                    max_overlap = overlap
+                                    best_speaker = spk_seg['speaker']
+                                    best_confidence = confidence
+                                else:
+                                    logger.debug(f"Rejected speaker assignment due to low confidence: {confidence:.3f} < {speaker_confidence_threshold}")
+                        
+                        # Assign speaker (default to SPEAKER_00 if no confident match)
+                        word['speaker'] = best_speaker if best_speaker else "SPEAKER_00"
+                        word['speaker_confidence'] = best_confidence if best_confidence > 0 else 0.5
+                else:
+                    # Segment-level assignment (when alignment was skipped - faster mode)
+                    logger.debug(f"Assigning speaker to segment-level timestamps: {segment_start:.1f}s - {segment_end:.1f}s")
                     
-                for word in segment['words']:
-                    word_start = word.get('start', 0)
-                    word_end = word.get('end', 0)
-                    
-                    # Find best matching speaker with confidence check
+                    # Find best matching speaker for entire segment
                     best_speaker = None
                     max_overlap = 0
                     best_confidence = 0
                     
                     for spk_seg in speaker_segments:
-                        # Calculate overlap
-                        overlap_start = max(word_start, spk_seg['start'])
-                        overlap_end = min(word_end, spk_seg['end'])
+                        # Calculate overlap with segment
+                        overlap_start = max(segment_start, spk_seg['start'])
+                        overlap_end = min(segment_end, spk_seg['end'])
                         overlap = max(0, overlap_end - overlap_start)
                         
                         if overlap > max_overlap:
@@ -264,17 +300,15 @@ class WhisperXDiarizationServer:
                                 max_overlap = overlap
                                 best_speaker = spk_seg['speaker']
                                 best_confidence = confidence
-                            else:
-                                logger.debug(f"Rejected speaker assignment due to low confidence: {confidence:.3f} < {speaker_confidence_threshold}")
                     
-                    # Assign speaker (default to SPEAKER_00 if no confident match)
-                    word['speaker'] = best_speaker if best_speaker else "SPEAKER_00"
-                    word['speaker_confidence'] = best_confidence if best_confidence > 0 else 0.5
+                    # Assign speaker to segment
+                    segment['speaker'] = best_speaker if best_speaker else "SPEAKER_00"
+                    segment['speaker_confidence'] = best_confidence if best_confidence > 0 else 0.5
             
             # Update segment-level speakers with confidence filtering
             for segment in transcription_result['segments']:
                 if 'words' in segment and segment['words']:
-                    # Use majority speaker for segment, but only count high-confidence assignments
+                    # Word-level mode: Use majority speaker for segment, but only count high-confidence assignments
                     confident_speakers = []
                     for w in segment['words']:
                         if 'speaker' in w and w.get('speaker_confidence', 0) >= speaker_confidence_threshold:
@@ -292,14 +326,24 @@ class WhisperXDiarizationServer:
                         speakers = [w.get('speaker', 'SPEAKER_00') for w in segment['words'] if 'speaker' in w]
                         segment['speaker'] = max(set(speakers), key=speakers.count) if speakers else "SPEAKER_00"
                         segment['speaker_confidence'] = 0.5  # Low confidence fallback
+                # Note: For segment-level mode, speaker already assigned above
             
             # Count unique speakers (only confident ones)
             confident_speakers = set()
+            total_speakers = set()
+            
             for segment in transcription_result['segments']:
+                # Count all speakers
+                if 'speaker' in segment:
+                    total_speakers.add(segment['speaker'])
+                    
+                # Count only confident speakers
                 if 'speaker' in segment and segment.get('speaker_confidence', 0) >= speaker_confidence_threshold:
                     confident_speakers.add(segment['speaker'])
             
-            logger.info(f"✅ Speaker assignment complete - {len(confident_speakers)} confident speakers detected")
+            assignment_mode = "word-level" if any('words' in seg for seg in transcription_result['segments']) else "segment-level"
+            logger.info(f"✅ Speaker assignment complete ({assignment_mode}) - {len(confident_speakers)} confident speakers detected")
+            logger.info(f"   Total speakers found: {len(total_speakers)}, Confident speakers: {len(confident_speakers)}")
             logger.info(f"   Speaker confidence threshold: {speaker_confidence_threshold}")
             return transcription_result
             
@@ -504,18 +548,23 @@ class WhisperXDiarizationServer:
             logger.error(f"Error in speaker smoothing: {e}")
             return result
 
-    def validate_speakers_with_vad(self, result: dict, audio_path: str) -> dict:
+    def validate_speakers_with_vad(self, result: dict, audio_path: str = None, cached_waveform_data=None) -> dict:
         """
-        OPTIMIZATION 2: VAD Cross-Reference
+        OPTIMIZATION 2: VAD Cross-Reference (OPTIMIZED)
         Validates speaker segments against Voice Activity Detection
+        Now uses cached waveform data to avoid redundant audio loading
         """
         try:
             logger.info("Validating speakers with VAD...")
             
-            # Use a simple VAD approach with torchaudio
-            import torch
-            import torchaudio.functional as F
-            waveform, sample_rate = torchaudio.load(audio_path)
+            # Use cached waveform data if available, otherwise load audio
+            if cached_waveform_data is not None:
+                waveform, sample_rate = cached_waveform_data
+                logger.info("Using cached waveform for VAD validation")
+            else:
+                # Fallback to loading audio (should rarely happen now)
+                logger.info("Loading audio for VAD validation (cache miss)")
+                waveform, sample_rate = torchaudio.load(audio_path)
             
             # Ensure mono
             if waveform.shape[0] > 1:
@@ -700,13 +749,24 @@ class WhisperXDiarizationServer:
             logger.error(f"Error in hierarchical clustering: {e}")
             return result
 
-    def preprocess_audio_for_diarization(self, audio_path: str) -> str:
+    def preprocess_audio_for_diarization(self, audio_path: str) -> tuple[str, tuple]:
         """
-        Preprocess audio to prevent tensor size mismatches in diarization
-        Ensures audio is mono, 16kHz, and properly formatted for pyannote
+        OPTIMIZED: Preprocess audio and cache waveform to prevent redundant loading
+        Returns: (temp_path, (waveform, sample_rate))
         """
         try:
-            # Load audio with torchaudio
+            # Check if we already have cached data for this audio path
+            if self.cached_audio_path == audio_path and self.cached_preprocessed_audio is not None:
+                logger.info(f"Using cached preprocessed audio for: {audio_path}")
+                # Still need to create temp file for diarization pipeline
+                waveform, sample_rate = self.cached_preprocessed_audio
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                    temp_path = tmp_file.name
+                    torchaudio.save(temp_path, waveform, sample_rate)
+                return temp_path, (waveform, sample_rate)
+            
+            # Load and preprocess audio
+            logger.info(f"Preprocessing audio for diarization: {audio_path}")
             waveform, sample_rate = torchaudio.load(audio_path)
             
             # Ensure mono audio
@@ -717,27 +777,32 @@ class WhisperXDiarizationServer:
             if sample_rate != 16000:
                 resampler = torchaudio.transforms.Resample(sample_rate, 16000)
                 waveform = resampler(waveform)
+                sample_rate = 16000
+            
+            # Cache the preprocessed audio
+            self.cached_preprocessed_audio = (waveform, sample_rate)
+            self.cached_audio_path = audio_path
             
             # Create temporary file for diarization
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
                 temp_path = tmp_file.name
-                torchaudio.save(temp_path, waveform, 16000)
+                torchaudio.save(temp_path, waveform, sample_rate)
             
-            logger.info(f"Audio preprocessed for diarization: {audio_path} -> {temp_path}")
-            return temp_path
+            logger.info(f"Audio preprocessed and cached: {audio_path} -> {temp_path}")
+            return temp_path, (waveform, sample_rate)
             
         except Exception as e:
             logger.error(f"Audio preprocessing failed: {e}")
-            # Return original path if preprocessing fails
-            return audio_path
+            # Return original path and None for waveform data if preprocessing fails
+            return audio_path, None
 
     async def transcribe_with_diarization(
         self, 
         audio_path: str, 
         enable_diarization: bool = True,
         language: str = "en",
-        model: str = "large-v2", 
-        batch_size: int = 8,
+        model: str = "large-v3-turbo", 
+        batch_size: int = 16,
         prompt: str = "",
         temperature: float = 0.0,
         timestamp_granularities: str = "segment",
@@ -748,7 +813,8 @@ class WhisperXDiarizationServer:
         speaker_confidence_threshold: float = 0.6,
         speaker_smoothing_enabled: bool = True,
         min_switch_duration: float = 2.0,
-        vad_validation_enabled: bool = False
+        vad_validation_enabled: bool = False,
+        optimized_alignment: bool = True
     ) -> dict:
         """
         Advanced transcription with diarization and storage integration
@@ -762,9 +828,10 @@ class WhisperXDiarizationServer:
             logger.info("Starting transcription...")
             start_time = time.time()
             
-            # GPU Memory management before transcription
+            # OPTIMIZATION: Strategic GPU Memory management
             if self.device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()  # Clear GPU cache
+                # Only clear cache at start of request, not between each step
+                torch.cuda.empty_cache()  # Clear GPU cache once at start
                 initial_memory = torch.cuda.memory_allocated() / 1e6  # MB
                 logger.info(f"GPU memory before transcription: {initial_memory:.1f} MB")
             
@@ -788,13 +855,11 @@ class WhisperXDiarizationServer:
             transcribe_time = time.time() - start_time
             logger.info(f"Transcription completed in {transcribe_time:.1f}s")
             
-            # Clean up GPU memory after transcription
-            if self.device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # OPTIMIZATION: Skip redundant cache clearing between steps
             
-            # Step 2: Align
-            if self.alignment_model and self.align_model_metadata:
-                logger.info("Starting alignment...")
+            # Step 2: Align (Conditional based on optimized_alignment flag)
+            if optimized_alignment and self.alignment_model and self.align_model_metadata:
+                logger.info("Using WAV2VEC2 alignment model for optimized alignment...")
                 start_time = time.time()
                 result = whisperx.align(
                     result["segments"],
@@ -805,7 +870,11 @@ class WhisperXDiarizationServer:
                     return_char_alignments=False
                 )
                 align_time = time.time() - start_time
-                logger.info(f"Alignment completed in {align_time:.1f}s")
+                logger.info(f"WAV2VEC2 alignment completed in {align_time:.1f}s")
+            else:
+                logger.info("Using Whisper built-in alignment (faster processing)...")
+                # Use Whisper's built-in timestamps - no external alignment needed
+                align_time = 0
             
             # Step 3: Diarization
             if enable_diarization and self.diarization_pipeline:
@@ -814,14 +883,14 @@ class WhisperXDiarizationServer:
                     logger.info("Starting diarization...")
                     start_time = time.time()
                     
-                    # GPU Memory management before diarization
+                    # OPTIMIZATION: Skip redundant cache clearing before diarization
                     if self.device == "cuda" and torch.cuda.is_available():
-                        torch.cuda.empty_cache()  # Clear GPU cache
                         initial_memory = torch.cuda.memory_allocated() / 1e6  # MB
                         logger.info(f"GPU memory before diarization: {initial_memory:.1f} MB")
                     
                     # Preprocess audio for diarization
-                    preprocessed_audio_path = self.preprocess_audio_for_diarization(audio_path)
+                    preprocessed_audio_path, cached_waveform_data = self.preprocess_audio_for_diarization(audio_path)
+                    waveform, sample_rate = cached_waveform_data if cached_waveform_data else (None, None)
                     
                     # Run diarization with GPU optimizations
                     # GPU-optimized parameters for faster processing
@@ -851,30 +920,20 @@ class WhisperXDiarizationServer:
                     # Run diarization on GPU (no parameters - configured above)
                     diarization_result = self.diarization_pipeline(preprocessed_audio_path)
                     
-                    # Apply advanced speaker assignment algorithm
-                    result = self.manual_speaker_assignment(result, diarization_result, speaker_confidence_threshold)
-                    
-                    # Apply spurious speaker filtering
-                    result = self.filter_spurious_speakers(result, min_speaker_duration, speaker_confidence_threshold)
-                    
-                    # Apply speaker smoothing
-                    result = self.smooth_speaker_changes(result, speaker_smoothing_enabled, min_switch_duration)
-
-                    # Apply VAD validation
-                    if vad_validation_enabled:
-                        result = self.validate_speakers_with_vad(result, audio_path)
-                    else:
-                        logger.info("VAD validation disabled - skipping")
-
-                    # Apply hierarchical clustering refinement
-                    result = self.apply_hierarchical_clustering(result)
+                    # OPTIMIZATION: Use combined post-processing pipeline
+                    result = self.optimized_diarization_postprocessing(
+                        result, diarization_result, speaker_confidence_threshold,
+                        min_speaker_duration, speaker_smoothing_enabled, min_switch_duration,
+                        vad_validation_enabled, audio_path, cached_waveform_data
+                    )
                     
                     diarize_time = time.time() - start_time
                     
-                    # GPU Memory cleanup and performance logging
+                    # OPTIMIZATION: Final GPU cleanup and performance logging
                     if self.device == "cuda" and torch.cuda.is_available():
                         final_memory = torch.cuda.memory_allocated() / 1e6  # MB
-                        torch.cuda.empty_cache()  # Clean up GPU memory
+                        # Only clean up GPU memory once at the very end
+                        torch.cuda.empty_cache()
                         logger.info(f"GPU memory after diarization: {final_memory:.1f} MB")
                         logger.info(f"🚀 GPU-accelerated diarization completed in {diarize_time:.1f}s")
                     else:
@@ -1064,6 +1123,234 @@ class WhisperXDiarizationServer:
             logger.error(f"Transcription failed: {e}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        finally:
+            # OPTIMIZATION: Clear audio cache to prevent memory leaks
+            self.clear_audio_cache()
+
+    def optimized_diarization_postprocessing(self, result: dict, diarization_result, speaker_confidence_threshold: float, min_speaker_duration: float, speaker_smoothing_enabled: bool, min_switch_duration: float, vad_validation_enabled: bool, audio_path: str = None, cached_waveform_data=None) -> dict:
+        """
+        OPTIMIZATION: Combined post-processing pipeline for better performance
+        Combines speaker assignment, filtering, and smoothing in optimized sequence
+        """
+        try:
+            logger.info("Starting optimized diarization post-processing pipeline...")
+            
+            # Step 1: Manual speaker assignment with confidence scoring
+            result = self.manual_speaker_assignment(result, diarization_result, speaker_confidence_threshold)
+            
+            # Step 2: Combined spurious speaker filtering and smoothing
+            # (More efficient than separate passes)
+            result = self.combined_speaker_filtering_and_smoothing(
+                result, min_speaker_duration, speaker_confidence_threshold,
+                speaker_smoothing_enabled, min_switch_duration
+            )
+            
+            # Step 3: VAD validation (only if enabled and we have cached data)
+            if vad_validation_enabled:
+                result = self.validate_speakers_with_vad(result, audio_path, cached_waveform_data)
+            
+            # Step 4: Hierarchical clustering refinement
+            result = self.apply_hierarchical_clustering(result)
+            
+            logger.info("✅ Optimized post-processing pipeline complete")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in optimized post-processing: {e}")
+            return result
+
+    def combined_speaker_filtering_and_smoothing(self, result: dict, min_speaker_duration: float, speaker_confidence_threshold: float, speaker_smoothing_enabled: bool, min_switch_duration: float) -> dict:
+        """
+        OPTIMIZATION: Combined filtering and smoothing in single pass
+        More efficient than separate operations
+        """
+        try:
+            segments = result.get('segments', [])
+            if len(segments) < 2:
+                return result
+                
+            logger.info("Applying combined speaker filtering and smoothing...")
+            
+            # First pass: Calculate speaker statistics for filtering
+            # Handle both word-level and segment-level modes
+            speaker_stats = {}
+            for segment in segments:
+                if 'words' in segment:
+                    # Word-level mode
+                    for word in segment['words']:
+                        speaker = word.get('speaker', 'SPEAKER_00')
+                        confidence = word.get('speaker_confidence', 0.5)
+                        duration = word.get('end', 0) - word.get('start', 0)
+                        
+                        if speaker not in speaker_stats:
+                            speaker_stats[speaker] = {
+                                'total_duration': 0,
+                                'confidences': [],
+                                'word_count': 0
+                            }
+                        
+                        speaker_stats[speaker]['total_duration'] += duration
+                        speaker_stats[speaker]['confidences'].append(confidence)
+                        speaker_stats[speaker]['word_count'] += 1
+                else:
+                    # Segment-level mode
+                    speaker = segment.get('speaker', 'SPEAKER_00')
+                    confidence = segment.get('speaker_confidence', 0.5)
+                    duration = segment.get('end', 0) - segment.get('start', 0)
+                    
+                    if speaker not in speaker_stats:
+                        speaker_stats[speaker] = {
+                            'total_duration': 0,
+                            'confidences': [],
+                            'word_count': 0
+                        }
+                    
+                    speaker_stats[speaker]['total_duration'] += duration
+                    speaker_stats[speaker]['confidences'].append(confidence)
+                    speaker_stats[speaker]['word_count'] += 1
+            
+            # Calculate average confidence per speaker
+            for speaker in speaker_stats:
+                confidences = speaker_stats[speaker]['confidences']
+                speaker_stats[speaker]['avg_confidence'] = sum(confidences) / len(confidences)
+            
+            # Identify spurious speakers with adaptive filtering
+            spurious_speakers = self.identify_spurious_speakers(speaker_stats, min_speaker_duration, speaker_confidence_threshold)
+            
+            # Find dominant speaker for reassignment
+            dominant_speaker = self.find_dominant_speaker(speaker_stats, spurious_speakers)
+            
+            # Combined pass: Apply smoothing AND spurious speaker reassignment
+            changes_made = 0
+            reassignments_made = 0
+            
+            for i, segment in enumerate(segments):
+                # Spurious speaker reassignment
+                if segment.get('speaker') in spurious_speakers:
+                    segment['speaker'] = dominant_speaker
+                    segment['speaker_confidence'] = 0.6
+                    if 'words' in segment:
+                        for word in segment['words']:
+                            if word.get('speaker') in spurious_speakers:
+                                word['speaker'] = dominant_speaker
+                                word['speaker_confidence'] = 0.6
+                    reassignments_made += 1
+                
+                # Speaker smoothing (A → B → A pattern detection)
+                if (speaker_smoothing_enabled and i > 0 and i < len(segments) - 1):
+                    prev_segment = segments[i - 1]
+                    next_segment = segments[i + 1]
+                    
+                    prev_speaker = prev_segment.get('speaker')
+                    current_speaker = segment.get('speaker')
+                    next_speaker = next_segment.get('speaker')
+                    
+                    # Check for A → B → A pattern
+                    if (prev_speaker == next_speaker and 
+                        current_speaker != prev_speaker and
+                        prev_speaker is not None and current_speaker is not None):
+                        
+                        current_duration = segment.get('end', 0) - segment.get('start', 0)
+                        
+                        if current_duration < min_switch_duration:
+                            # Check confidence levels
+                            prev_conf = prev_segment.get('speaker_confidence', 0.5)
+                            current_conf = segment.get('speaker_confidence', 0.5)
+                            next_conf = next_segment.get('speaker_confidence', 0.5)
+                            
+                            avg_surrounding_conf = (prev_conf + next_conf) / 2
+                            if avg_surrounding_conf > current_conf:
+                                # Apply smoothing
+                                segment['speaker'] = prev_speaker
+                                segment['speaker_confidence'] = avg_surrounding_conf
+                                
+                                if 'words' in segment:
+                                    for word in segment['words']:
+                                        word['speaker'] = prev_speaker
+                                        word['speaker_confidence'] = avg_surrounding_conf
+                                
+                                changes_made += 1
+            
+            if spurious_speakers:
+                logger.info(f"✅ Removed {len(spurious_speakers)} spurious speakers, reassigned {reassignments_made} segments")
+            
+            if changes_made > 0:
+                logger.info(f"✅ Applied speaker smoothing to {changes_made} segments")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in combined filtering and smoothing: {e}")
+            return result
+
+    def identify_spurious_speakers(self, speaker_stats: dict, min_speaker_duration: float, speaker_confidence_threshold: float) -> list:
+        """Helper method to identify spurious speakers with adaptive thresholds"""
+        spurious_speakers = []
+        total_speakers = len(speaker_stats)
+        
+        # Adaptive filtering based on speaker count
+        if total_speakers <= 3:
+            duration_multiplier = 2.0
+            confidence_multiplier = 1.2
+            word_multiplier = 1.5
+        else:
+            duration_multiplier = 0.8
+            confidence_multiplier = 0.9
+            word_multiplier = 0.8
+        
+        for speaker, stats in speaker_stats.items():
+            is_spurious = False
+            
+            # Duration check
+            adaptive_min_duration = min_speaker_duration * duration_multiplier
+            if stats['total_duration'] < adaptive_min_duration:
+                is_spurious = True
+            
+            # Confidence check
+            all_confidences = [stats['avg_confidence'] for stats in speaker_stats.values()]
+            if len(all_confidences) > 1:
+                base_threshold = min(speaker_confidence_threshold, max(all_confidences) * 0.75)
+                confidence_threshold = base_threshold * confidence_multiplier
+            else:
+                confidence_threshold = speaker_confidence_threshold * 0.8 * confidence_multiplier
+            
+            if stats['avg_confidence'] < confidence_threshold:
+                is_spurious = True
+            
+            # Word count check
+            adaptive_min_words = max(5, adaptive_min_duration * 2 * word_multiplier)
+            if stats['word_count'] < adaptive_min_words:
+                is_spurious = True
+            
+            if is_spurious:
+                spurious_speakers.append(speaker)
+        
+        return spurious_speakers
+
+    def find_dominant_speaker(self, speaker_stats: dict, spurious_speakers: list) -> str:
+        """Helper method to find the most reliable speaker for reassignment"""
+        if not speaker_stats:
+            return "SPEAKER_00"
+        
+        reliable_speakers = {
+            spk: stats['avg_confidence'] * stats['total_duration']
+            for spk, stats in speaker_stats.items()
+            if spk not in spurious_speakers
+        }
+        
+        if reliable_speakers:
+            return max(reliable_speakers.items(), key=lambda x: x[1])[0]
+        else:
+            return "SPEAKER_00"
+
+    def clear_audio_cache(self):
+        """
+        OPTIMIZATION: Clear cached audio data to prevent memory leaks
+        Should be called at the end of each request
+        """
+        self.cached_preprocessed_audio = None
+        self.cached_audio_path = None
+        logger.debug("Cleared audio preprocessing cache")
 
 # FastAPI app
 app = FastAPI(title="WhisperX Diarization Server with Multi-Cloud Storage")
@@ -1374,14 +1661,15 @@ async def create_transcription(
     prompt: str = Form("", description="Optional text prompt to provide context or guide the transcription (e.g., proper names, technical terms)"),
     
     # === FINE-TUNING SETTINGS SECTION ===
-    batch_size: int = Form(8, description="Batch size for processing (higher = faster but more memory)"),
+    batch_size: int = Form(16, description="Batch size for processing (higher = faster but more memory)"),
     clustering_threshold: float = Form(0.7, description="Speaker clustering threshold (0.5-1.0, lower = more speakers)"),
     segmentation_threshold: float = Form(0.45, description="Voice activity detection threshold (0.1-0.9)"),
     min_speaker_duration: float = Form(3.0, description="Minimum speaking time per speaker (seconds)"),
     speaker_confidence_threshold: float = Form(0.6, description="Minimum confidence for speaker assignment (0.1-1.0)"),
     speaker_smoothing_enabled: bool = Form(True, description="Enable speaker transition smoothing"),
     min_switch_duration: float = Form(2.0, description="Minimum time between speaker switches (seconds)"),
-    vad_validation_enabled: bool = Form(False, description="Enable Voice Activity Detection validation (experimental)")
+    vad_validation_enabled: bool = Form(False, description="Enable Voice Activity Detection validation (experimental)"),
+    optimized_alignment: bool = Form(True, description="Use WAV2VEC2 alignment model (True) or Whisper built-in alignment (False) - False is faster")
 ):
     """
     **Advanced Audio Transcription with Speaker Identification**
@@ -1451,8 +1739,8 @@ async def create_transcription(
         # Check for model parameter (ignored)
         if "model" in form_data:
             model_value = form_data.get("model")
-            if model_value != "large-v2":
-                ignored_params.append(f"model={model_value} (using large-v2)")
+            if model_value != "large-v3-turbo":
+                ignored_params.append(f"model={model_value} (using large-v3-turbo)")
         
         # Check for temperature parameter (ignored)
         if "temperature" in form_data:
@@ -1491,7 +1779,7 @@ async def create_transcription(
             temp_audio_path, 
             enable_diarization=enable_diarization,
             language=language,
-            model="large-v2",  # Always use large-v2 (ignored parameters handled above)
+            model="large-v3-turbo",  # Performance optimized model
             batch_size=batch_size,
             prompt=prompt,
             temperature=0.0,  # Always use 0.0 (ignored parameters handled above)
@@ -1503,7 +1791,8 @@ async def create_transcription(
             speaker_confidence_threshold=speaker_confidence_threshold,
             speaker_smoothing_enabled=speaker_smoothing_enabled,
             min_switch_duration=min_switch_duration,
-            vad_validation_enabled=vad_validation_enabled
+            vad_validation_enabled=vad_validation_enabled,
+            optimized_alignment=optimized_alignment
         )
         
         # Handle output to storage based on user's requirements:
