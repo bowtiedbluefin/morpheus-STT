@@ -29,7 +29,7 @@ import numpy as np
 
 import whisperx
 import torchaudio
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -42,6 +42,7 @@ import httpx
 import io
 from urllib.parse import urlparse
 import requests
+import uuid
 
 # Load environment
 load_dotenv()
@@ -1477,6 +1478,87 @@ async def upload_to_user_presigned_url(result: dict, presigned_url: str) -> str:
     except Exception as e:
         raise HTTPException(500, f"Failed to upload to user-provided URL: {str(e)}")
 
+async def process_transcription_background(
+    job_id: str,
+    temp_audio_path: str,
+    upload_presigned_url: str,
+    enable_diarization: bool,
+    language: str,
+    batch_size: int,
+    prompt: str,
+    timestamp_granularities: str,
+    output_content: str,
+    clustering_threshold: float,
+    segmentation_threshold: float,
+    min_speaker_duration: float,
+    speaker_confidence_threshold: float,
+    speaker_smoothing_enabled: bool,
+    min_switch_duration: float,
+    vad_validation_enabled: bool,
+    optimized_alignment: bool
+):
+    """
+    Background task to process transcription and upload result to user's S3 bucket
+    """
+    try:
+        logger.info(f"🔄 Starting background transcription for job {job_id}")
+        
+        # Process transcription
+        result = await server.transcribe_with_diarization(
+            temp_audio_path, 
+            enable_diarization=enable_diarization,
+            language=language,
+            model="large-v3-turbo",
+            batch_size=batch_size,
+            prompt=prompt,
+            temperature=0.0,
+            timestamp_granularities=timestamp_granularities,
+            output_content=output_content,
+            clustering_threshold=clustering_threshold,
+            segmentation_threshold=segmentation_threshold,
+            min_speaker_duration=min_speaker_duration,
+            speaker_confidence_threshold=speaker_confidence_threshold,
+            speaker_smoothing_enabled=speaker_smoothing_enabled,
+            min_switch_duration=min_switch_duration,
+            vad_validation_enabled=vad_validation_enabled,
+            optimized_alignment=optimized_alignment
+        )
+        
+        # Add job ID to result
+        if isinstance(result, dict):
+            result["job_id"] = job_id
+            result["status"] = "completed"
+        
+        # Upload to user's presigned URL
+        await upload_to_user_presigned_url(result, upload_presigned_url)
+        
+        logger.info(f"✅ Background job {job_id} completed successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Background job {job_id} failed: {e}")
+        logger.error(traceback.format_exc())
+        
+        # Try to upload error result to user's URL
+        try:
+            error_result = {
+                "job_id": job_id,
+                "status": "failed",
+                "error": str(e),
+                "error_type": type(e).__name__
+            }
+            await upload_to_user_presigned_url(error_result, upload_presigned_url)
+        except Exception as upload_error:
+            logger.error(f"Failed to upload error result for job {job_id}: {upload_error}")
+    
+    finally:
+        # Cleanup temporary files
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            try:
+                os.unlink(temp_audio_path)
+                logger.debug(f"Cleaned up temporary audio file for job {job_id}: {temp_audio_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup temporary file {temp_audio_path}: {cleanup_error}")
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize models and storage clients on startup"""
@@ -1639,6 +1721,7 @@ async def download_from_storage(
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
     request: Request,
+    background_tasks: BackgroundTasks,
     
     # === FILE INPUT SECTION ===
     file: Optional[UploadFile] = File(None, description="Audio file to upload and transcribe"),
@@ -1649,10 +1732,10 @@ async def create_transcription(
     
     # === TRANSCRIPTION OUTPUT SECTION ===
     response_format: str = Form("json", description="Response format: json, verbose_json, text, srt, vtt"),
-    output_content: str = Form("both", description="Include both JSON and plain text in response"),
+    output_content: str = Form("both", description="Controls response content - 'text_only': plain text, 'timestamps_only': JSON with timestamps, 'both': text + timestamps, 'metadata_only': processing info only"),
     stored_output: bool = Form(False, description="Enable result storage - True: Save to storage, False: API response only"),
     output_key: Optional[str] = Form(None, description="Custom storage object key (auto-generated if not provided)"),
-    upload_presigned_url: Optional[str] = Form(None, description="Pre-signed upload URL to save results to your own S3 bucket (overrides server storage)"),
+    upload_presigned_url: Optional[str] = Form(None, description="Pre-signed upload URL to save results to your own S3 bucket (enables async processing - returns immediately with job status)"),
     
     # === TRANSCRIPTION SETTINGS SECTION ===
     language: str = Form("en", description="Language code (e.g., 'en', 'es', 'fr', 'de')"),
@@ -1686,16 +1769,30 @@ async def create_transcription(
     
     **📄 Transcription Output:**
     - `response_format`: Choose output format (JSON, SRT, VTT, plain text)
-    - `output_content`: Control what's included in response
+    - `output_content`: Control what's included in response:
+      - `text_only`: Returns only plain text transcription (no timestamps)
+      - `timestamps_only`: Returns JSON with timestamps and segments (no separate text field)
+      - `both`: Returns both plain text AND timestamped segments (default)
+      - `metadata_only`: Returns only processing metadata (no transcription text)
     - `stored_output`: Enable/disable result storage (false = API response only)
-    - `upload_presigned_url`: Upload to your own S3 bucket (overrides server storage)
+    - `upload_presigned_url`: Upload to your own S3 bucket (enables async mode)
     - `output_key`: Custom storage object key (auto-generated if not provided)
     
-    **Output Logic:**
+    **⚡ Processing Modes:**
+    - **Async Mode** (when `upload_presigned_url` is provided):
+      - Returns immediately with job status and metadata
+      - Processes transcription in background
+      - Uploads result to your S3 bucket when complete
+      - Use S3 event notifications (Lambda) to detect completion
+    - **Sync Mode** (when `upload_presigned_url` is NOT provided):
+      - Waits for transcription to complete
+      - Returns full result in API response
+      - Optionally stores result if `stored_output` is true
+    
+    **Output Logic (Sync Mode):**
     - If `stored_output` is `false`: Results returned in API response only
     - If `stored_output` is `true`:
-      - If `upload_presigned_url` is provided: Upload to user's S3 bucket
-      - Otherwise: Upload to server's downloads bucket
+      - Upload to server's downloads bucket (retrievable via /v1/downloads endpoint)
     
     **⚙️ Transcription Settings:**
     - Multi-language support with automatic detection
@@ -1774,7 +1871,61 @@ async def create_transcription(
             logger.info(f"Processing pre-signed URL: {s3_presigned_url[:50]}...")
             temp_audio_path = await download_from_s3_presigned(s3_presigned_url)
         
-        # Process transcription
+        # ASYNC PROCESSING MODE: If upload_presigned_url is provided, return immediately
+        if upload_presigned_url:
+            # Generate unique job ID
+            job_id = str(uuid.uuid4())
+            
+            logger.info(f"🚀 Starting async transcription job {job_id}")
+            logger.info(f"   Will upload results to user-provided presigned URL")
+            
+            # Prepare timestamp granularities for response
+            granularities = [g.strip().lower() for g in timestamp_granularities.split(',')]
+            
+            # Start background processing
+            background_tasks.add_task(
+                process_transcription_background,
+                job_id=job_id,
+                temp_audio_path=temp_audio_path,
+                upload_presigned_url=upload_presigned_url,
+                enable_diarization=enable_diarization,
+                language=language,
+                batch_size=batch_size,
+                prompt=prompt,
+                timestamp_granularities=timestamp_granularities,
+                output_content=output_content,
+                clustering_threshold=clustering_threshold,
+                segmentation_threshold=segmentation_threshold,
+                min_speaker_duration=min_speaker_duration,
+                speaker_confidence_threshold=speaker_confidence_threshold,
+                speaker_smoothing_enabled=speaker_smoothing_enabled,
+                min_switch_duration=min_switch_duration,
+                vad_validation_enabled=vad_validation_enabled,
+                optimized_alignment=optimized_alignment
+            )
+            
+            # Return immediate response with job metadata
+            return {
+                "job_id": job_id,
+                "status": "in_progress",
+                "message": "Transcription job started. Results will be uploaded to your S3 bucket when complete.",
+                "processing_info": {
+                    "device": server.device,
+                    "language": language,
+                    "timestamp_granularities": granularities,
+                    "diarization_enabled": enable_diarization,
+                    "optimized_alignment": optimized_alignment
+                },
+                "storage_info": {
+                    "uploaded": False,
+                    "storage_url": upload_presigned_url,
+                    "key": "user-specified",
+                    "service": "User S3 Bucket",
+                    "notification": "Use S3 event notifications to detect when the result file is uploaded"
+                }
+            }
+        
+        # SYNCHRONOUS PROCESSING MODE: Process transcription and wait for completion
         result = await server.transcribe_with_diarization(
             temp_audio_path, 
             enable_diarization=enable_diarization,

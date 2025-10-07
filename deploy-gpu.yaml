@@ -1,9 +1,17 @@
 ---
 version: "2.0"
 
+# WhisperX Transcription API with Async Processing Support
+# =========================================================
+# Features:
+# - Async mode: Returns immediately when upload_presigned_url is provided
+# - Sync mode: Waits for completion and returns full result
+# - Advanced speaker diarization with confidence scoring
+# - Multi-cloud storage integration (R2, S3)
+
 services:
   whisper-api:
-    image: kylecohen01/whisper-transcription-api:4.5
+    image: kylecohen01/whisper-transcription-api:4.6
     expose:
       - port: 3333
         as: 80
@@ -11,8 +19,8 @@ services:
           - global: true
         http_options:
           max_body_size: 4294967295
-          read_timeout: 3600000
-          send_timeout: 600000
+          read_timeout: 3600000  # 1 hour for large files (sync mode)
+          send_timeout: 600000   # 10 minutes
           next_cases:
             - error
             - timeout
@@ -40,8 +48,8 @@ services:
       - WHISPERX_COMPUTE_TYPE=float32
       - WHISPERX_BATCH_SIZE=16
       - WHISPERX_CHAR_ALIGN=false
-      - MAX_CONCURRENT_REQUESTS=4
-      - MEMORY_PER_REQUEST_GB=6.0
+      - MAX_CONCURRENT_REQUESTS=12
+      - MEMORY_PER_REQUEST_GB=1.0
       - WHISPERX_CHUNK_LENGTH=30
       - VAD_ONSET=0.500
       - VAD_OFFSET=0.200

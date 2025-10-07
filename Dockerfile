@@ -19,8 +19,10 @@ RUN pip install --no-cache-dir --prefix="/install" psutil && \
 # Install remaining packages including text processing libraries and pyannote.audio
 # Includes: nemo-text-processing (with pynini/OpenFST), contractions, pyannote.audio, and other dependencies
 # Note: nemo-text-processing works on Linux x86_64 with existing build-essential
-RUN grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" > requirements_filtered.txt && \
-    pip install --no-cache-dir --prefix="/install" -r requirements_filtered.txt
+# CRITICAL: Install tokenizers and transformers first with locked versions to prevent conflicts
+RUN pip install --no-cache-dir --prefix="/install" "tokenizers==0.21.4" "transformers==4.54.1" && \
+    grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" | grep -v "^tokenizers" | grep -v "^transformers" > requirements_filtered.txt && \
+    pip install --no-cache-dir --prefix="/install" --upgrade-strategy only-if-needed -r requirements_filtered.txt
 
 # --- Final Stage ---  
 FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04
@@ -51,8 +53,8 @@ RUN apt-get update && apt-get install -y \
 ENV WHISPERX_COMPUTE_TYPE=float32
 ENV WHISPERX_BATCH_SIZE=16
 ENV WHISPERX_CHAR_ALIGN=false
-ENV MAX_CONCURRENT_REQUESTS=3
-ENV MEMORY_PER_REQUEST_GB=6.0
+ENV MAX_CONCURRENT_REQUESTS=12
+ENV MEMORY_PER_REQUEST_GB=1.0
 
 # Enhanced VAD Configuration (addressing customer feedback)
 ENV WHISPERX_CHUNK_LENGTH=30
