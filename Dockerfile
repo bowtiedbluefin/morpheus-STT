@@ -10,17 +10,14 @@ WORKDIR /app
 # Copy requirements and install with selective filtering
 COPY requirements.txt .
 
-# Install core packages with EXACT versions matching working venv
+# Install core packages
 RUN pip install --no-cache-dir --prefix="/install" psutil && \
     pip install --no-cache-dir --prefix="/install" torch==2.6.0+cu126 torchaudio==2.6.0+cu126 torchvision==0.21.0+cu126 --index-url https://download.pytorch.org/whl/cu126 && \
     pip install --no-cache-dir --prefix="/install" ctranslate2==4.4.0 && \
     pip install --no-cache-dir --prefix="/install" whisperx==3.4.2
 
 # Install remaining packages including text processing libraries and pyannote.audio
-# Includes: nemo-text-processing (with pynini/OpenFST), contractions, pyannote.audio, and other dependencies
-# Note: nemo-text-processing works on Linux x86_64 with existing build-essential
-# CRITICAL: Install tokenizers and transformers first with locked versions to prevent conflicts
-RUN pip install --no-cache-dir --prefix="/install" "tokenizers==0.21.4" "transformers==4.54.1" && \
+RUN pip install --no-cache-dir --prefix="/install" "transformers>=4.54.0" && \
     grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" | grep -v "^tokenizers" | grep -v "^transformers" > requirements_filtered.txt && \
     pip install --no-cache-dir --prefix="/install" --upgrade-strategy only-if-needed -r requirements_filtered.txt
 
@@ -32,10 +29,10 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH="/install/lib/python3.12/site-packages"
 
-# PyTorch CUDA library isolation for optimal performance
+# PyTorch CUDA library isolation 
 ENV LD_LIBRARY_PATH="/install/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/install/lib/python3.12/site-packages/nvidia/cudnn/lib:/install/lib/python3.12/site-packages/nvidia/cublas/lib:/install/lib/python3.12/site-packages/nvidia/cufft/lib:/install/lib/python3.12/site-packages/nvidia/curand/lib:/install/lib/python3.12/site-packages/nvidia/cusolver/lib:/install/lib/python3.12/site-packages/nvidia/cusparse/lib"
 
-# Install system dependencies including Python 3.12
+# Install system dependencies 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 RUN apt-get update && apt-get install -y \
@@ -49,14 +46,14 @@ RUN apt-get update && apt-get install -y \
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
  && rm -rf /var/lib/apt/lists/*
 
-# Enhanced WhisperX Configuration (Performance Optimized)
+# Enhanced WhisperX Configuration 
 ENV WHISPERX_COMPUTE_TYPE=float32
 ENV WHISPERX_BATCH_SIZE=16
 ENV WHISPERX_CHAR_ALIGN=false
 ENV MAX_CONCURRENT_REQUESTS=12
 ENV MEMORY_PER_REQUEST_GB=1.0
 
-# Enhanced VAD Configuration (addressing customer feedback)
+# Enhanced VAD Configuration
 ENV WHISPERX_CHUNK_LENGTH=30
 ENV VAD_ONSET=0.35
 ENV VAD_OFFSET=0.25
@@ -64,7 +61,7 @@ ENV MIN_SEGMENT_LENGTH=0.5
 ENV MAX_SEGMENT_LENGTH=30.0
 ENV SPEECH_THRESHOLD=0.6
 
-# Speaker Attribution Improvements (Optimized Diarization System)
+# Speaker Attribution Improvements
 ENV PYANNOTE_CLUSTERING_THRESHOLD=0.7
 ENV PYANNOTE_SEGMENTATION_THRESHOLD=0.45
 ENV SPEAKER_CONFIDENCE_THRESHOLD=0.6

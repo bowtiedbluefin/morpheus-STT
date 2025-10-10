@@ -26,10 +26,11 @@ import shutil
 import subprocess
 import time
 import numpy as np
+import asyncio
 
 import whisperx
 import torchaudio
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -1454,20 +1455,45 @@ async def upload_result_to_storage(result: dict, bucket: str, key: str, use_r2: 
 async def upload_to_user_presigned_url(result: dict, presigned_url: str) -> str:
     """Upload transcription result to user-provided pre-signed URL"""
     import httpx
+    import zlib
+    import base64
+    from urllib.parse import parse_qs, urlparse
     
     try:
         # Convert result to JSON
         result_json = json.dumps(result, indent=2, ensure_ascii=False)
+        body = result_json.encode('utf-8')
+        
+        # Parse URL to check for checksum requirements
+        parsed = urlparse(presigned_url)
+        query_params = parse_qs(parsed.query)
+        
+        # Prepare headers
+        headers = {}
+        
+        # Check if URL requires CRC32 checksum (AWS SDK generated URLs often include this)
+        if 'x-amz-checksum-crc32' in query_params or 'x-amz-sdk-checksum-algorithm' in query_params:
+            # Calculate CRC32 checksum
+            crc32_value = zlib.crc32(body) & 0xffffffff
+            crc32_b64 = base64.b64encode(crc32_value.to_bytes(4, 'big')).decode('utf-8')
+            headers['x-amz-checksum-crc32'] = crc32_b64
+            headers['x-amz-sdk-checksum-algorithm'] = 'CRC32'
+            logger.info(f"Added CRC32 checksum to upload: {crc32_b64}")
+        
+        # Always set Content-Type for JSON
+        headers['Content-Type'] = 'application/json'
         
         # Upload using the pre-signed URL
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.put(
                 presigned_url,
-                content=result_json.encode('utf-8'),
-                headers={'Content-Type': 'application/json'}
+                content=body,
+                headers=headers
             )
             
             if response.status_code not in [200, 201]:
+                # Log response body for debugging
+                logger.error(f"S3 upload failed with {response.status_code}: {response.text[:500]}")
                 raise HTTPException(500, f"Failed to upload to user URL: HTTP {response.status_code}")
         
         logger.info(f"Successfully uploaded result to user-provided URL")
@@ -1480,7 +1506,7 @@ async def upload_to_user_presigned_url(result: dict, presigned_url: str) -> str:
 
 async def process_transcription_background(
     job_id: str,
-    temp_audio_path: str,
+    temp_audio_path: Optional[str],
     upload_presigned_url: str,
     enable_diarization: bool,
     language: str,
@@ -1495,13 +1521,26 @@ async def process_transcription_background(
     speaker_smoothing_enabled: bool,
     min_switch_duration: float,
     vad_validation_enabled: bool,
-    optimized_alignment: bool
+    optimized_alignment: bool,
+    s3_presigned_url: Optional[str] = None,
+    storage_key: Optional[str] = None
 ):
     """
     Background task to process transcription and upload result to user's S3 bucket
+    Handles downloading audio from s3_presigned_url or storage_key if provided
     """
     try:
         logger.info(f"🔄 Starting background transcription for job {job_id}")
+        
+        # If temp_audio_path not provided, download the audio in background
+        if not temp_audio_path:
+            if s3_presigned_url:
+                logger.info(f"Downloading audio from pre-signed URL in background...")
+                temp_audio_path = await download_from_s3_presigned(s3_presigned_url)
+            elif storage_key:
+                logger.info(f"Downloading audio from storage in background...")
+                bucket = DEFAULT_UPLOAD_BUCKET
+                temp_audio_path = await download_from_r2(bucket, storage_key)
         
         # Process transcription
         result = await server.transcribe_with_diarization(
@@ -1721,7 +1760,6 @@ async def download_from_storage(
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
     request: Request,
-    background_tasks: BackgroundTasks,
     
     # === FILE INPUT SECTION ===
     file: Optional[UploadFile] = File(None, description="Audio file to upload and transcribe"),
@@ -1814,6 +1852,43 @@ async def create_transcription(
     """
     temp_audio_path = None
     try:
+        # DEBUG: Track timing
+        import time
+        start_time = time.time()
+        logger.info(f"🚀 Request started at {start_time}")
+
+        # Check for async mode FIRST before any processing
+        # This allows immediate response instead of waiting for downloads or form processing
+        is_async_mode = bool(upload_presigned_url)
+        logger.info(f"⚡ Async mode check took {time.time() - start_time:.3f}s - Async: {is_async_mode}")
+
+        # Handle legacy parameters if provided (model, temperature) - these are ignored but logged
+        # Only process form data if NOT in async mode to avoid blocking the response
+        ignored_params = []
+        if not is_async_mode:
+            form_data = await request.form()
+
+            # Check for model parameter (ignored)
+            if "model" in form_data:
+                model_value = form_data.get("model")
+                if model_value != "large-v3-turbo":
+                    ignored_params.append(f"model={model_value} (using large-v3-turbo)")
+
+            # Check for temperature parameter (ignored)
+            if "temperature" in form_data:
+                temperature_value = form_data.get("temperature")
+                try:
+                    temp_float = float(temperature_value)
+                    if temp_float != 0.0:
+                        ignored_params.append(f"temperature={temperature_value} (using 0.0)")
+                except (ValueError, TypeError):
+                    ignored_params.append(f"temperature={temperature_value} (invalid, using 0.0)")
+
+        if ignored_params:
+            logger.info(f"ℹ️  Ignored parameters in this request: {', '.join(ignored_params)}")
+
+        logger.info(f"🔍 Input validation start at {time.time() - start_time:.3f}s")
+
         # Validate input parameters
         file_provided = file is not None and file.filename is not None and file.filename.strip() != ""
         input_sources = sum([
@@ -1821,90 +1896,97 @@ async def create_transcription(
             bool(storage_key),
             bool(s3_presigned_url)
         ])
-        
+
         if input_sources == 0:
             raise HTTPException(400, "One input source required: file upload, storage_key, or s3_presigned_url")
         elif input_sources > 1:
             raise HTTPException(400, "Only one input source allowed at a time")
+
+        logger.info(f"✅ Input validation took {time.time() - start_time:.3f}s - Sources: {input_sources}")
         
-        # Output key handling is now done in the storage logic based on stored_output parameter
-        
-        # Handle legacy parameters if provided (model, temperature) - these are ignored but logged
-        form_data = await request.form()
-        ignored_params = []
-        
-        # Check for model parameter (ignored)
-        if "model" in form_data:
-            model_value = form_data.get("model")
-            if model_value != "large-v3-turbo":
-                ignored_params.append(f"model={model_value} (using large-v3-turbo)")
-        
-        # Check for temperature parameter (ignored)
-        if "temperature" in form_data:
-            temperature_value = form_data.get("temperature")
-            try:
-                temp_float = float(temperature_value)
-                if temp_float != 0.0:
-                    ignored_params.append(f"temperature={temperature_value} (using 0.0)")
-            except (ValueError, TypeError):
-                ignored_params.append(f"temperature={temperature_value} (invalid, using 0.0)")
-        
-        if ignored_params:
-            logger.info(f"ℹ️  Ignored parameters in this request: {', '.join(ignored_params)}")
-        
+        logger.info(f"🔄 Input source handling start at {time.time() - start_time:.3f}s")
+
         # Handle different input sources
         if file:
-            # Direct file upload (existing functionality)
+            # Direct file upload
             logger.info("Processing direct file upload")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
                 temp_audio_path = temp_file.name
                 shutil.copyfileobj(file.file, temp_file)
-                
+            logger.info(f"File saved to {temp_audio_path}")
+
         elif storage_key:
             # Storage object download from configured bucket
-            bucket = DEFAULT_UPLOAD_BUCKET
-            logger.info(f"Processing storage object: {bucket}/{storage_key}")
-            temp_audio_path = await download_from_r2(bucket, storage_key)
-            
+            if is_async_mode:
+                # ASYNC MODE: Don't download yet, let background task do it
+                logger.info(f"Async mode: Will download from storage in background")
+                temp_audio_path = None  # Background task will download
+            else:
+                # SYNC MODE: Download now
+                bucket = DEFAULT_UPLOAD_BUCKET
+                logger.info(f"Processing storage object: {bucket}/{storage_key}")
+                temp_audio_path = await download_from_r2(bucket, storage_key)
+
         elif s3_presigned_url:
-            # Pre-signed S3 URL download
-            logger.info(f"Processing pre-signed URL: {s3_presigned_url[:50]}...")
-            temp_audio_path = await download_from_s3_presigned(s3_presigned_url)
+            # Pre-signed S3 URL - download NOW for sync mode, or LATER in background for async mode
+            if is_async_mode:
+                # ASYNC MODE: Don't download yet, let background task do it
+                logger.info(f"Async mode: Will download from pre-signed URL in background")
+                temp_audio_path = None  # Background task will download
+            else:
+                # SYNC MODE: Download now
+                logger.info(f"Processing pre-signed URL: {s3_presigned_url[:50]}...")
+                temp_audio_path = await download_from_s3_presigned(s3_presigned_url)
+
+        logger.info(f"✅ Input source handling took {time.time() - start_time:.3f}s")
         
+        logger.info(f"🎯 Async response start at {time.time() - start_time:.3f}s")
+
         # ASYNC PROCESSING MODE: If upload_presigned_url is provided, return immediately
         if upload_presigned_url:
             # Generate unique job ID
             job_id = str(uuid.uuid4())
-            
+
             logger.info(f"🚀 Starting async transcription job {job_id}")
             logger.info(f"   Will upload results to user-provided presigned URL")
-            
+
             # Prepare timestamp granularities for response
             granularities = [g.strip().lower() for g in timestamp_granularities.split(',')]
-            
-            # Start background processing
-            background_tasks.add_task(
-                process_transcription_background,
-                job_id=job_id,
-                temp_audio_path=temp_audio_path,
-                upload_presigned_url=upload_presigned_url,
-                enable_diarization=enable_diarization,
-                language=language,
-                batch_size=batch_size,
-                prompt=prompt,
-                timestamp_granularities=timestamp_granularities,
-                output_content=output_content,
-                clustering_threshold=clustering_threshold,
-                segmentation_threshold=segmentation_threshold,
-                min_speaker_duration=min_speaker_duration,
-                speaker_confidence_threshold=speaker_confidence_threshold,
-                speaker_smoothing_enabled=speaker_smoothing_enabled,
-                min_switch_duration=min_switch_duration,
-                vad_validation_enabled=vad_validation_enabled,
-                optimized_alignment=optimized_alignment
+
+            logger.info(f"📋 Background task setup start at {time.time() - start_time:.3f}s")
+
+            # Start background processing using asyncio.create_task for true decoupling
+            # This ensures the HTTP connection closes immediately without waiting for the task
+            asyncio.create_task(
+                process_transcription_background(
+                    job_id=job_id,
+                    temp_audio_path=temp_audio_path,  # Will be path if file uploaded, None if download needed
+                    upload_presigned_url=upload_presigned_url,
+                    enable_diarization=enable_diarization,
+                    language=language,
+                    batch_size=batch_size,
+                    prompt=prompt,
+                    timestamp_granularities=timestamp_granularities,
+                    output_content=output_content,
+                    clustering_threshold=clustering_threshold,
+                    segmentation_threshold=segmentation_threshold,
+                    min_speaker_duration=min_speaker_duration,
+                    speaker_confidence_threshold=speaker_confidence_threshold,
+                    speaker_smoothing_enabled=speaker_smoothing_enabled,
+                    min_switch_duration=min_switch_duration,
+                    vad_validation_enabled=vad_validation_enabled,
+                    optimized_alignment=optimized_alignment,
+                    s3_presigned_url=s3_presigned_url,  # Pass to background task for download if needed
+                    storage_key=storage_key  # Pass to background task for download if needed
+                )
             )
-            
+
+            logger.info(f"✅ Background task setup took {time.time() - start_time:.3f}s")
+
             # Return immediate response with job metadata
+            response_time = time.time() - start_time
+            logger.info(f"⚡ RETURNING ASYNC RESPONSE at {response_time:.3f}s")
+
             return {
                 "job_id": job_id,
                 "status": "in_progress",
@@ -2033,8 +2115,9 @@ async def create_transcription(
         logger.error(f"Transcription request failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Cleanup temporary files (from any source: direct upload, storage, or S3)
-        if temp_audio_path and os.path.exists(temp_audio_path):
+        # Cleanup temporary files ONLY in sync mode
+        # In async mode, the background task will clean up after processing
+        if temp_audio_path and os.path.exists(temp_audio_path) and not upload_presigned_url:
             try:
                 os.unlink(temp_audio_path)
                 logger.debug(f"Cleaned up temporary audio file: {temp_audio_path}")
