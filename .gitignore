@@ -138,4 +138,23 @@ transcription*.json
 transcription*.txt
 
 # Performance analysis files
-performance_analysis*.md 
+performance_analysis*.md
+
+# Test scripts and development files
+test_*.py
+test_*.log
+test_*.sh
+generate_upload_url.py
+analyze_customer_url.py
+test_concurrent_uploads.py
+test_simple_concurrency.py
+test_runpod_*.py
+test_parallel_*.py
+test_single_job.py
+
+# Development documentation
+BROKEN_DIFFERENCES.md
+CHANGES_SUMMARY.txt
+CONCURRENCY_UPDATE.md
+QUICK_FIX_REFERENCE.md
+FEATURES_PORTED_*.md 

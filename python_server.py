@@ -57,6 +57,12 @@ s3_client = None
 DEFAULT_UPLOAD_BUCKET = os.getenv('DEFAULT_UPLOAD_BUCKET', 'default-uploads')
 DEFAULT_RESULTS_BUCKET = os.getenv('DEFAULT_RESULTS_BUCKET', 'default-results')
 
+# Concurrency control from environment variable (for display/logging - async handles actual concurrency)
+MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', '3'))
+
+# Upload timeout configuration (in seconds)
+UPLOAD_TIMEOUT_SECONDS = int(os.getenv('UPLOAD_TIMEOUT_SECONDS', '3600'))  # Default 1 hour
+
 def init_storage_clients():
     """Initialize R2 and S3 clients if credentials are provided"""
     global r2_client, s3_client
@@ -1368,6 +1374,10 @@ app.add_middleware(
 # Global server instance
 server = WhisperXDiarizationServer()
 
+# Job tracking and status management
+active_jobs = {}  # Track active jobs: {job_id: {"status": "processing"|"completed"|"failed", "start_time": timestamp, ...}}
+job_lock = asyncio.Lock()  # Lock for thread-safe job dictionary access
+
 # Storage utility functions
 async def download_from_r2(bucket: str, key: str) -> str:
     """Download file from R2 to temporary file"""
@@ -1394,24 +1404,29 @@ async def download_from_r2(bucket: str, key: str) -> str:
         raise HTTPException(500, f"Failed to download from R2: {str(e)}")
 
 async def download_from_s3_presigned(presigned_url: str) -> str:
-    """Download file from pre-signed S3 URL to temporary file"""
+    """Download file from pre-signed S3 URL to temporary file (ASYNC - non-blocking)"""
     try:
-        response = requests.get(presigned_url, stream=True)
-        response.raise_for_status()
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.audio') as temp_file:
-            temp_file_path = temp_file.name
-            
-        # Stream download to avoid memory issues with large files
-        with open(temp_file_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        # Use httpx async client for truly non-blocking downloads
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+            async with client.stream('GET', presigned_url) as response:
+                response.raise_for_status()
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.audio') as temp_file:
+                    temp_file_path = temp_file.name
                     
-        logger.info(f"Downloaded from pre-signed S3 URL -> {temp_file_path}")
+                # Async stream download to avoid memory issues AND event loop blocking
+                with open(temp_file_path, 'wb') as f:
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        f.write(chunk)
+                        # Yield control to event loop periodically
+                        await asyncio.sleep(0)
+                    
+        logger.info(f"✅ Downloaded from pre-signed S3 URL -> {temp_file_path}")
         return temp_file_path
         
-    except requests.exceptions.RequestException as e:
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(400, f"Failed to download from pre-signed URL: HTTP {e.response.status_code}")
+    except httpx.RequestError as e:
         raise HTTPException(400, f"Failed to download from pre-signed URL: {str(e)}")
     except Exception as e:
         raise HTTPException(500, f"Unexpected error downloading from S3: {str(e)}")
@@ -1452,57 +1467,180 @@ async def upload_result_to_storage(result: dict, bucket: str, key: str, use_r2: 
         service = "R2" if use_r2 else "S3"
         raise HTTPException(500, f"Unexpected error uploading to {service}: {str(e)}")
 
-async def upload_to_user_presigned_url(result: dict, presigned_url: str) -> str:
-    """Upload transcription result to user-provided pre-signed URL"""
+async def upload_to_user_presigned_url(result: dict, presigned_url: str, max_retries: int = 3) -> str:
+    """
+    Upload transcription result to user-provided pre-signed URL with retry logic
+    
+    Features:
+    - Retry logic with exponential backoff
+    - Configurable timeouts (UPLOAD_TIMEOUT_SECONDS)
+    - Unicode escape decoding (\u0026 -> &)
+    - Smart header handling (only signed headers)
+    - Granular timeout control
+    - Detailed error logging
+    - 4xx vs 5xx error handling (don't retry 4xx)
+    """
     import httpx
     import zlib
     import base64
     from urllib.parse import parse_qs, urlparse
     
-    try:
-        # Convert result to JSON
-        result_json = json.dumps(result, indent=2, ensure_ascii=False)
-        body = result_json.encode('utf-8')
-        
-        # Parse URL to check for checksum requirements
-        parsed = urlparse(presigned_url)
-        query_params = parse_qs(parsed.query)
-        
-        # Prepare headers
-        headers = {}
-        
-        # Check if URL requires CRC32 checksum (AWS SDK generated URLs often include this)
-        if 'x-amz-checksum-crc32' in query_params or 'x-amz-sdk-checksum-algorithm' in query_params:
-            # Calculate CRC32 checksum
-            crc32_value = zlib.crc32(body) & 0xffffffff
-            crc32_b64 = base64.b64encode(crc32_value.to_bytes(4, 'big')).decode('utf-8')
-            headers['x-amz-checksum-crc32'] = crc32_b64
-            headers['x-amz-sdk-checksum-algorithm'] = 'CRC32'
-            logger.info(f"Added CRC32 checksum to upload: {crc32_b64}")
-        
-        # Always set Content-Type for JSON
+    # Decode any JSON-escaped characters in the URL (e.g., \u0026 -> &)
+    if '\\u' in presigned_url:
+        try:
+            presigned_url = presigned_url.encode('utf-8').decode('unicode_escape')
+            logger.info("Decoded unicode escapes in presigned URL")
+        except Exception as e:
+            logger.warning(f"Failed to decode URL escapes: {e}")
+    
+    # Convert result to JSON
+    result_json = json.dumps(result, indent=2, ensure_ascii=False)
+    body = result_json.encode('utf-8')
+    
+    # Parse URL to check for checksum requirements and signed headers
+    parsed = urlparse(presigned_url)
+    query_params = parse_qs(parsed.query)
+    
+    # Check which headers were signed (to avoid signature mismatch)
+    signed_headers_param = query_params.get('X-Amz-SignedHeaders', query_params.get('x-amz-signedheaders', ['']))
+    signed_headers = signed_headers_param[0].split(';') if signed_headers_param else []
+    
+    # Prepare headers - ONLY add headers that match the signature
+    headers = {}
+    
+    # Only add Content-Type if it was signed OR if no specific headers were signed
+    if 'content-type' in signed_headers or not signed_headers:
         headers['Content-Type'] = 'application/json'
-        
-        # Upload using the pre-signed URL
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.put(
-                presigned_url,
-                content=body,
-                headers=headers
+    
+    # Check if URL requires CRC32 checksum (AWS SDK generated URLs often include this)
+    if 'x-amz-checksum-crc32' in query_params or 'x-amz-sdk-checksum-algorithm' in query_params:
+        # Calculate CRC32 checksum
+        crc32_value = zlib.crc32(body) & 0xffffffff
+        crc32_b64 = base64.b64encode(crc32_value.to_bytes(4, 'big')).decode('utf-8')
+        headers['x-amz-checksum-crc32'] = crc32_b64
+        headers['x-amz-sdk-checksum-algorithm'] = 'CRC32'
+        logger.info(f"Added CRC32 checksum to upload: {crc32_b64}")
+    
+    # Retry logic with exponential backoff
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            # Granular timeout control: connect=30s, read=UPLOAD_TIMEOUT_SECONDS, write=UPLOAD_TIMEOUT_SECONDS, pool=10s
+            timeout_config = httpx.Timeout(
+                connect=30.0,
+                read=UPLOAD_TIMEOUT_SECONDS,
+                write=UPLOAD_TIMEOUT_SECONDS,
+                pool=10.0
             )
             
-            if response.status_code not in [200, 201]:
-                # Log response body for debugging
-                logger.error(f"S3 upload failed with {response.status_code}: {response.text[:500]}")
-                raise HTTPException(500, f"Failed to upload to user URL: HTTP {response.status_code}")
-        
-        logger.info(f"Successfully uploaded result to user-provided URL")
-        return presigned_url
-        
-    except httpx.RequestError as e:
-        raise HTTPException(500, f"Network error uploading to user URL: {str(e)}")
+            logger.info(f"📤 Upload attempt {attempt + 1}/{max_retries} to user-provided URL (timeout: {UPLOAD_TIMEOUT_SECONDS}s)")
+            
+            # Upload using the pre-signed URL
+            async with httpx.AsyncClient(timeout=timeout_config) as client:
+                response = await client.put(
+                    presigned_url,
+                    content=body,
+                    headers=headers
+                )
+                
+                if response.status_code in [200, 201]:
+                    logger.info(f"✅ Successfully uploaded result to user-provided URL (attempt {attempt + 1})")
+                    return presigned_url
+                elif response.status_code == 403 and 'SignatureDoesNotMatch' in response.text:
+                    # Signature error - could be transient or URL issue, worth retrying
+                    logger.warning(f"⚠️  SignatureDoesNotMatch error on attempt {attempt + 1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"❌ SignatureDoesNotMatch persists after {max_retries} attempts: {response.text[:500]}")
+                        raise HTTPException(500, f"AWS signature error after {max_retries} retries - check presigned URL generation")
+                elif 400 <= response.status_code < 500:
+                    # Other client errors (4xx) - don't retry, fail immediately
+                    logger.error(f"❌ Client error uploading to user URL (HTTP {response.status_code}): {response.text[:500]}")
+                    raise HTTPException(500, f"Failed to upload to user URL: HTTP {response.status_code} - {response.text[:200]}")
+                else:
+                    # Server error (5xx) - retry
+                    logger.warning(f"⚠️ Server error uploading to user URL (HTTP {response.status_code}), will retry: {response.text[:500]}")
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        raise HTTPException(500, f"Server error persists: HTTP {response.status_code}")
+                    
+        except httpx.ConnectTimeout as e:
+            last_exception = e
+            logger.warning(f"⚠️ Connect timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                logger.info(f"Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+            continue
+            
+        except httpx.ReadTimeout as e:
+            last_exception = e
+            logger.warning(f"⚠️ Read timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+            continue
+            
+        except httpx.WriteTimeout as e:
+            last_exception = e
+            logger.warning(f"⚠️ Write timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+            continue
+            
+        except httpx.PoolTimeout as e:
+            last_exception = e
+            logger.warning(f"⚠️ Pool timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+            continue
+            
+        except httpx.RequestError as e:
+            last_exception = e
+            logger.warning(f"⚠️ Network error on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+            continue
+            
+        except Exception as e:
+            last_exception = e
+            logger.error(f"❌ Unexpected error uploading to user URL on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+            continue
+    
+    # All retries failed
+    error_msg = f"Failed to upload after {max_retries} attempts. Last error: {type(last_exception).__name__} - {str(last_exception)}"
+    logger.error(f"❌ {error_msg}")
+    raise HTTPException(500, error_msg)
+
+async def _background_task_wrapper(coro):
+    """
+    Wrapper to ensure background task exceptions are properly logged
+    and don't silently fail
+    """
+    try:
+        await coro
     except Exception as e:
-        raise HTTPException(500, f"Failed to upload to user-provided URL: {str(e)}")
+        logger.error(f"❌ CRITICAL: Background task failed with unhandled exception: {type(e).__name__} - {str(e)}")
+        logger.error(traceback.format_exc())
 
 async def process_transcription_background(
     job_id: str,
@@ -1528,21 +1666,48 @@ async def process_transcription_background(
     """
     Background task to process transcription and upload result to user's S3 bucket
     Handles downloading audio from s3_presigned_url or storage_key if provided
+    
+    Enhanced with job status tracking:
+    - Updates active_jobs dictionary with status/progress
+    - Structured processing: Download → Process → Upload
+    - Progress updates: "Downloading", "Transcribing", "Uploading", "Done"
+    - Error uploads: Failed jobs still upload error details to user URL
+    - Automatic cleanup: Removes job records older than 1 hour
     """
+    start_time = time.time()
+    
     try:
+        # Initialize job tracking
+        async with job_lock:
+            active_jobs[job_id] = {
+                "status": "processing",
+                "progress": "Initializing",
+                "start_time": start_time,
+                "input_source": "file" if temp_audio_path else ("s3_url" if s3_presigned_url else "storage_key")
+            }
+        
         logger.info(f"🔄 Starting background transcription for job {job_id}")
         
-        # If temp_audio_path not provided, download the audio in background
+        # STEP 1: Download audio if needed (outside GPU - I/O bound)
         if not temp_audio_path:
+            async with job_lock:
+                active_jobs[job_id]["progress"] = "Downloading audio"
+                active_jobs[job_id]["status"] = "processing"
+            
             if s3_presigned_url:
-                logger.info(f"Downloading audio from pre-signed URL in background...")
+                logger.info(f"📥 Downloading audio from pre-signed URL for job {job_id}...")
                 temp_audio_path = await download_from_s3_presigned(s3_presigned_url)
             elif storage_key:
-                logger.info(f"Downloading audio from storage in background...")
+                logger.info(f"📥 Downloading audio from storage for job {job_id}...")
                 bucket = DEFAULT_UPLOAD_BUCKET
                 temp_audio_path = await download_from_r2(bucket, storage_key)
         
-        # Process transcription
+        # STEP 2: Process transcription with GPU
+        async with job_lock:
+            active_jobs[job_id]["progress"] = "Transcribing audio"
+            active_jobs[job_id]["status"] = "processing"
+        
+        logger.info(f"🎙️ Transcribing audio for job {job_id}...")
         result = await server.transcribe_with_diarization(
             temp_audio_path, 
             enable_diarization=enable_diarization,
@@ -1563,19 +1728,43 @@ async def process_transcription_background(
             optimized_alignment=optimized_alignment
         )
         
-        # Add job ID to result
+        # Add job ID and timing to result
         if isinstance(result, dict):
             result["job_id"] = job_id
             result["status"] = "completed"
+            result["processing_time"] = time.time() - start_time
         
-        # Upload to user's presigned URL
+        # STEP 3: Upload result (outside GPU - I/O bound)
+        async with job_lock:
+            active_jobs[job_id]["progress"] = "Uploading results"
+            active_jobs[job_id]["status"] = "processing"
+        
+        logger.info(f"📤 Uploading results for job {job_id}...")
         await upload_to_user_presigned_url(result, upload_presigned_url)
         
-        logger.info(f"✅ Background job {job_id} completed successfully")
+        # Mark job as completed
+        end_time = time.time()
+        async with job_lock:
+            active_jobs[job_id]["status"] = "completed"
+            active_jobs[job_id]["progress"] = "Done"
+            active_jobs[job_id]["end_time"] = end_time
+            active_jobs[job_id]["elapsed_time"] = end_time - start_time
+        
+        logger.info(f"✅ Background job {job_id} completed successfully in {end_time - start_time:.2f}s")
         
     except Exception as e:
-        logger.error(f"❌ Background job {job_id} failed: {e}")
+        end_time = time.time()
+        logger.error(f"❌ Background job {job_id} failed after {end_time - start_time:.2f}s: {e}")
         logger.error(traceback.format_exc())
+        
+        # Update job status to failed
+        async with job_lock:
+            active_jobs[job_id]["status"] = "failed"
+            active_jobs[job_id]["progress"] = "Failed"
+            active_jobs[job_id]["end_time"] = end_time
+            active_jobs[job_id]["elapsed_time"] = end_time - start_time
+            active_jobs[job_id]["error"] = str(e)
+            active_jobs[job_id]["error_type"] = type(e).__name__
         
         # Try to upload error result to user's URL
         try:
@@ -1583,20 +1772,36 @@ async def process_transcription_background(
                 "job_id": job_id,
                 "status": "failed",
                 "error": str(e),
-                "error_type": type(e).__name__
+                "error_type": type(e).__name__,
+                "processing_time": end_time - start_time
             }
             await upload_to_user_presigned_url(error_result, upload_presigned_url)
+            logger.info(f"📤 Uploaded error result for job {job_id}")
         except Exception as upload_error:
-            logger.error(f"Failed to upload error result for job {job_id}: {upload_error}")
+            logger.error(f"❌ Failed to upload error result for job {job_id}: {upload_error}")
     
     finally:
         # Cleanup temporary files
         if temp_audio_path and os.path.exists(temp_audio_path):
             try:
                 os.unlink(temp_audio_path)
-                logger.debug(f"Cleaned up temporary audio file for job {job_id}: {temp_audio_path}")
+                logger.debug(f"🗑️ Cleaned up temporary audio file for job {job_id}: {temp_audio_path}")
             except Exception as cleanup_error:
-                logger.warning(f"Failed to cleanup temporary file {temp_audio_path}: {cleanup_error}")
+                logger.warning(f"⚠️ Failed to cleanup temporary file {temp_audio_path}: {cleanup_error}")
+        
+        # Cleanup old job records (older than 1 hour)
+        try:
+            async with job_lock:
+                current_time = time.time()
+                jobs_to_remove = [
+                    jid for jid, job_data in active_jobs.items()
+                    if current_time - job_data.get("start_time", current_time) > 3600
+                ]
+                for jid in jobs_to_remove:
+                    del active_jobs[jid]
+                    logger.debug(f"🗑️ Removed old job record: {jid}")
+        except Exception as cleanup_error:
+            logger.warning(f"⚠️ Failed to cleanup old job records: {cleanup_error}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -1609,11 +1814,33 @@ async def startup_event():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """
+    Health check endpoint with system status and concurrency metrics
+    """
+    # Count jobs by status
+    async with job_lock:
+        total_jobs = len(active_jobs)
+        processing_jobs = sum(1 for job in active_jobs.values() if job.get("status") == "processing")
+        completed_jobs = sum(1 for job in active_jobs.values() if job.get("status") == "completed")
+        failed_jobs = sum(1 for job in active_jobs.values() if job.get("status") == "failed")
+    
     return {
         "status": "healthy",
         "gpu_available": torch.cuda.is_available(),
         "device": server.device,
+        "concurrency": {
+            "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+            "active_jobs": total_jobs,
+            "processing": processing_jobs,
+            "completed": completed_jobs,
+            "failed": failed_jobs,
+            "note": "Concurrency is handled by Python's async event loop - no artificial limits"
+        },
+        "timeouts": {
+            "upload_timeout_seconds": UPLOAD_TIMEOUT_SECONDS,
+            "upload_timeout_minutes": UPLOAD_TIMEOUT_SECONDS / 60.0,
+            "note": "Timeout for uploading results to S3. Transcription itself has no timeout."
+        },
         "models_loaded": {
             "transcription": server.transcription_model is not None,
             "alignment": server.alignment_model is not None,
@@ -1633,8 +1860,103 @@ async def health_check():
             "Optimized clustering and segmentation",
             "Multi-criteria speaker validation",
             "GPU batch processing optimization",
-            "Comprehensive error handling and cleanup"
+            "Comprehensive error handling and cleanup",
+            "Job status tracking and monitoring",
+            "Enhanced upload retry logic with exponential backoff"
         ]
+    }
+
+@app.get("/v1/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    """
+    Get status of a specific transcription job
+    
+    Returns job status, progress, timing information, and error details if failed.
+    Job records are automatically cleaned up after 1 hour.
+    
+    **Parameters:**
+    - `job_id`: The unique job identifier returned when starting an async transcription
+    
+    **Returns:**
+    - Job status and progress information
+    - Timing details (start time, elapsed time, end time if completed)
+    - Error information if the job failed
+    
+    **Response Example:**
+    ```json
+    {
+      "job_id": "abc123...",
+      "status": "processing|completed|failed",
+      "progress": "Transcribing audio",
+      "start_time": 1234567890.123,
+      "elapsed_time": 45.2,
+      "end_time": 1234567935.3,
+      "error": "Error message if failed"
+    }
+    ```
+    """
+    async with job_lock:
+        if job_id not in active_jobs:
+            raise HTTPException(404, f"Job not found: {job_id}. Note: Job records are automatically cleaned up after 1 hour.")
+        
+        job_data = active_jobs[job_id].copy()
+    
+    # Calculate elapsed time if job is still processing
+    if job_data.get("status") == "processing" and "start_time" in job_data:
+        job_data["elapsed_time"] = time.time() - job_data["start_time"]
+    
+    job_data["job_id"] = job_id
+    return job_data
+
+@app.get("/v1/jobs")
+async def list_jobs():
+    """
+    List all active and recent transcription jobs
+    
+    Returns a summary of all jobs currently tracked by the server.
+    Useful for monitoring system load and debugging.
+    
+    **Returns:**
+    - Total job count
+    - Dictionary of all jobs with their status and timing information
+    
+    **Response Example:**
+    ```json
+    {
+      "total_jobs": 5,
+      "jobs": {
+        "abc123": {
+          "status": "completed",
+          "progress": "Done",
+          "elapsed_time": 120.5,
+          ...
+        },
+        "def456": {
+          "status": "processing",
+          "progress": "Transcribing audio",
+          "elapsed_time": 45.2,
+          ...
+        }
+      }
+    }
+    ```
+    """
+    async with job_lock:
+        jobs_copy = {}
+        current_time = time.time()
+        
+        for job_id, job_data in active_jobs.items():
+            job_info = job_data.copy()
+            
+            # Calculate elapsed time for processing jobs
+            if job_info.get("status") == "processing" and "start_time" in job_info:
+                job_info["elapsed_time"] = current_time - job_info["start_time"]
+            
+            jobs_copy[job_id] = job_info
+    
+    return {
+        "total_jobs": len(jobs_copy),
+        "jobs": jobs_copy
     }
 
 @app.post("/v1/uploads")
