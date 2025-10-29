@@ -2,15 +2,7 @@
 """
 WhisperX Diarization Server with Multi-Cloud Storage Integration
 ===============================================================
-Production-ready speech-to-text server with advanced diarization capabilities
-and comprehensive cloud storage support (Cloudflare R2, AWS S3).
-
-Features:
-- GPU-accelerated transcription and diarization
-- Multiple input sources (direct upload, R2 objects, pre-signed S3 URLs)
-- Automatic result export to cloud storage
-- Advanced speaker recognition and optimization
-- OpenAI-compatible API with extended functionality
+Production-ready speech-to-text server with advanced diarization capabilities.
 """
 
 import logging
@@ -30,7 +22,7 @@ import asyncio
 
 import whisperx
 import torchaudio
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -44,6 +36,7 @@ import io
 from urllib.parse import urlparse
 import requests
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 # Load environment
 load_dotenv()
@@ -57,11 +50,36 @@ s3_client = None
 DEFAULT_UPLOAD_BUCKET = os.getenv('DEFAULT_UPLOAD_BUCKET', 'default-uploads')
 DEFAULT_RESULTS_BUCKET = os.getenv('DEFAULT_RESULTS_BUCKET', 'default-results')
 
-# Concurrency control from environment variable (for display/logging - async handles actual concurrency)
-MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', '3'))
+# Concurrency control from environment variable
+# This limits how many GPU transcriptions can run simultaneously
+MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', '4'))  # Default 4 for GPU concurrency
 
 # Upload timeout configuration (in seconds)
 UPLOAD_TIMEOUT_SECONDS = int(os.getenv('UPLOAD_TIMEOUT_SECONDS', '3600'))  # Default 1 hour
+
+# Job processing timeout configuration (in seconds)
+# Maximum time a job can run before being abandoned/cancelled
+# Default: 86400 seconds (24 hours)
+# Set to 0 to disable timeout (not recommended)
+JOB_PROCESSING_TIMEOUT_SECONDS = int(os.getenv('JOB_PROCESSING_TIMEOUT_SECONDS', '86400'))
+
+# Job result retention configuration (in seconds)
+# How long to keep job results stored locally for retrieval via GET /v1/jobs/{job_id}
+# Default: 86400 seconds (24 hours)
+# Set to 0 to disable server-side result storage
+JOB_RESULT_RETENTION_SECONDS = int(os.getenv('JOB_RESULT_RETENTION_SECONDS', '86400'))
+
+# Local directory for storing job results
+JOB_RESULTS_DIR = os.getenv('JOB_RESULTS_DIR', '/tmp/whisper-job-results')
+
+# Thread pool for GPU work - limited to prevent GPU memory exhaustion
+# This allows multiple transcriptions to run concurrently on the GPU
+gpu_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix="gpu_worker")
+
+# Ensure job results directory exists
+if JOB_RESULT_RETENTION_SECONDS > 0:
+    os.makedirs(JOB_RESULTS_DIR, exist_ok=True)
+    logger = logging.getLogger(__name__)  # Will be redefined later, but needed for startup
 
 def init_storage_clients():
     """Initialize R2 and S3 clients if credentials are provided"""
@@ -145,10 +163,8 @@ class WhisperXDiarizationServer:
         self.vad_validation_enabled = os.getenv("VAD_VALIDATION_ENABLED", "false").lower() == "true"
         # WhisperX batch size optimization
         self.batch_size = int(os.getenv("WHISPERX_BATCH_SIZE", "16"))
-        
-        # OPTIMIZATION: Cache preprocessed audio to avoid redundant processing
-        self.cached_preprocessed_audio = None
-        self.cached_audio_path = None
+        # Alignment optimization (enabled by default for best accuracy - WAV2VEC2 is slow but highest quality)
+        self.use_optimized_alignment = os.getenv("USE_OPTIMIZED_ALIGNMENT", "true").lower() == "true"
         
         logger.info(f"🚀 WhisperX Diarization Server with Storage Integration")
         logger.info(f"Device: {self.device}")
@@ -158,6 +174,7 @@ class WhisperXDiarizationServer:
         logger.info(f"   Segmentation Threshold: {self.segmentation_threshold}")
         logger.info(f"   Min Speaker Duration: {self.min_speaker_duration}s")
         logger.info(f"   Speaker Confidence Threshold: {self.speaker_confidence_threshold}")
+        logger.info(f"   Optimized Alignment (WAV2VEC2): {self.use_optimized_alignment}")
         if torch.cuda.is_available():
             logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
             logger.info(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
@@ -759,20 +776,10 @@ class WhisperXDiarizationServer:
 
     def preprocess_audio_for_diarization(self, audio_path: str) -> tuple[str, tuple]:
         """
-        OPTIMIZED: Preprocess audio and cache waveform to prevent redundant loading
+        Preprocess audio for diarization (thread-safe - no cache)
         Returns: (temp_path, (waveform, sample_rate))
         """
         try:
-            # Check if we already have cached data for this audio path
-            if self.cached_audio_path == audio_path and self.cached_preprocessed_audio is not None:
-                logger.info(f"Using cached preprocessed audio for: {audio_path}")
-                # Still need to create temp file for diarization pipeline
-                waveform, sample_rate = self.cached_preprocessed_audio
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                    temp_path = tmp_file.name
-                    torchaudio.save(temp_path, waveform, sample_rate)
-                return temp_path, (waveform, sample_rate)
-            
             # Load and preprocess audio
             logger.info(f"Preprocessing audio for diarization: {audio_path}")
             waveform, sample_rate = torchaudio.load(audio_path)
@@ -787,10 +794,6 @@ class WhisperXDiarizationServer:
                 waveform = resampler(waveform)
                 sample_rate = 16000
             
-            # Cache the preprocessed audio
-            self.cached_preprocessed_audio = (waveform, sample_rate)
-            self.cached_audio_path = audio_path
-            
             # Create temporary file for diarization
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
                 temp_path = tmp_file.name
@@ -804,7 +807,7 @@ class WhisperXDiarizationServer:
             # Return original path and None for waveform data if preprocessing fails
             return audio_path, None
 
-    async def transcribe_with_diarization(
+    def transcribe_with_diarization(
         self, 
         audio_path: str, 
         enable_diarization: bool = True,
@@ -825,7 +828,7 @@ class WhisperXDiarizationServer:
         optimized_alignment: bool = True
     ) -> dict:
         """
-        Advanced transcription with diarization and storage integration
+        Synchronous GPU transcription with diarization - runs in thread pool for concurrency
         """
         try:
             # Load models if not already loaded
@@ -868,6 +871,14 @@ class WhisperXDiarizationServer:
             # Step 2: Align (Conditional based on optimized_alignment flag)
             if optimized_alignment and self.alignment_model and self.align_model_metadata:
                 logger.info("Using WAV2VEC2 alignment model for optimized alignment...")
+                
+                # GPU verification logging
+                if self.device == "cuda" and torch.cuda.is_available():
+                    pre_align_memory = torch.cuda.memory_allocated() / 1e6  # MB
+                    logger.info(f"GPU memory before alignment: {pre_align_memory:.1f} MB")
+                    logger.info(f"Alignment model device: {self.device}")
+                    logger.info(f"✅ GPU will be used for WAV2VEC2 alignment")
+                
                 start_time = time.time()
                 result = whisperx.align(
                     result["segments"],
@@ -878,6 +889,13 @@ class WhisperXDiarizationServer:
                     return_char_alignments=False
                 )
                 align_time = time.time() - start_time
+                
+                # Post-alignment GPU stats
+                if self.device == "cuda" and torch.cuda.is_available():
+                    post_align_memory = torch.cuda.memory_allocated() / 1e6  # MB
+                    memory_used = post_align_memory - pre_align_memory
+                    logger.info(f"GPU memory after alignment: {post_align_memory:.1f} MB (used {memory_used:.1f} MB)")
+                
                 logger.info(f"WAV2VEC2 alignment completed in {align_time:.1f}s")
             else:
                 logger.info("Using Whisper built-in alignment (faster processing)...")
@@ -1131,9 +1149,6 @@ class WhisperXDiarizationServer:
             logger.error(f"Transcription failed: {e}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
-        finally:
-            # OPTIMIZATION: Clear audio cache to prevent memory leaks
-            self.clear_audio_cache()
 
     def optimized_diarization_postprocessing(self, result: dict, diarization_result, speaker_confidence_threshold: float, min_speaker_duration: float, speaker_smoothing_enabled: bool, min_switch_duration: float, vad_validation_enabled: bool, audio_path: str = None, cached_waveform_data=None) -> dict:
         """
@@ -1351,14 +1366,6 @@ class WhisperXDiarizationServer:
         else:
             return "SPEAKER_00"
 
-    def clear_audio_cache(self):
-        """
-        OPTIMIZATION: Clear cached audio data to prevent memory leaks
-        Should be called at the end of each request
-        """
-        self.cached_preprocessed_audio = None
-        self.cached_audio_path = None
-        logger.debug("Cleared audio preprocessing cache")
 
 # FastAPI app
 app = FastAPI(title="WhisperX Diarization Server with Multi-Cloud Storage")
@@ -1378,17 +1385,91 @@ server = WhisperXDiarizationServer()
 active_jobs = {}  # Track active jobs: {job_id: {"status": "processing"|"completed"|"failed", "start_time": timestamp, ...}}
 job_lock = asyncio.Lock()  # Lock for thread-safe job dictionary access
 
+# Helper functions for local job result storage
+def get_job_result_path(job_id: str) -> str:
+    """Get the file path for a job result"""
+    return os.path.join(JOB_RESULTS_DIR, f"{job_id}.json")
+
+def save_job_result_local(job_id: str, result: dict) -> None:
+    """Save job result to local filesystem"""
+    if JOB_RESULT_RETENTION_SECONDS <= 0:
+        return
+    
+    result_path = get_job_result_path(job_id)
+    try:
+        with open(result_path, 'w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        logger.debug(f"💾 Saved job result locally: {result_path}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save job result locally: {e}")
+
+def load_job_result_local(job_id: str) -> Optional[dict]:
+    """Load job result from local filesystem"""
+    if JOB_RESULT_RETENTION_SECONDS <= 0:
+        return None
+    
+    result_path = get_job_result_path(job_id)
+    if not os.path.exists(result_path):
+        return None
+    
+    try:
+        with open(result_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"❌ Failed to load job result from {result_path}: {e}")
+        return None
+
+def cleanup_old_job_results() -> int:
+    """
+    Clean up job result files older than JOB_RESULT_RETENTION_SECONDS
+    Returns number of files cleaned up
+    """
+    if JOB_RESULT_RETENTION_SECONDS <= 0:
+        return 0
+    
+    if not os.path.exists(JOB_RESULTS_DIR):
+        return 0
+    
+    current_time = time.time()
+    cleanup_count = 0
+    
+    try:
+        for filename in os.listdir(JOB_RESULTS_DIR):
+            if not filename.endswith('.json'):
+                continue
+            
+            file_path = os.path.join(JOB_RESULTS_DIR, filename)
+            try:
+                # Check file age based on modification time
+                file_mtime = os.path.getmtime(file_path)
+                if current_time - file_mtime > JOB_RESULT_RETENTION_SECONDS:
+                    os.unlink(file_path)
+                    cleanup_count += 1
+                    logger.debug(f"🗑️ Cleaned up old job result: {filename}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to cleanup {filename}: {e}")
+        
+        if cleanup_count > 0:
+            logger.info(f"🗑️ Cleaned up {cleanup_count} old job result(s)")
+    except Exception as e:
+        logger.error(f"❌ Error during job result cleanup: {e}")
+    
+    return cleanup_count
+
 # Storage utility functions
 async def download_from_r2(bucket: str, key: str) -> str:
-    """Download file from R2 to temporary file"""
+    """Download file from R2 to temporary file (ASYNC - non-blocking)"""
     if not r2_client:
         raise HTTPException(500, "R2 client not configured")
     
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.audio') as temp_file:
-            temp_file_path = temp_file.name
-            
-        r2_client.download_file(bucket, key, temp_file_path)
+        temp_file_path = tempfile.mktemp(suffix='.audio')
+        
+        # Run boto3 download in thread pool to avoid blocking event loop
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: r2_client.download_file(bucket, key, temp_file_path)
+        )
         logger.info(f"Downloaded R2 object: s3://{bucket}/{key} -> {temp_file_path}")
         return temp_file_path
         
@@ -1505,21 +1586,21 @@ async def upload_to_user_presigned_url(result: dict, presigned_url: str, max_ret
     signed_headers_param = query_params.get('X-Amz-SignedHeaders', query_params.get('x-amz-signedheaders', ['']))
     signed_headers = signed_headers_param[0].split(';') if signed_headers_param else []
     
-    # Prepare headers - ONLY add headers that match the signature
-    headers = {}
+    # CRITICAL: Only send headers that were actually signed in the presigned URL
+    # AWS will reject the request if we add ANY headers that weren't signed
+    # 
+    # HOWEVER: Content-Type is special - if not signed, AWS will use binary/octet-stream
+    # We MUST add it to get proper JSON content type, even if not in signed headers
+    headers = {'Content-Type': 'application/json'}
     
-    # Only add Content-Type if it was signed OR if no specific headers were signed
-    if 'content-type' in signed_headers or not signed_headers:
-        headers['Content-Type'] = 'application/json'
+    # Log whether Content-Type was in signed headers
+    if 'content-type' in signed_headers:
+        logger.info("✅ Content-Type was signed in URL - explicitly setting to application/json")
+    else:
+        logger.info("⚠️  Content-Type NOT signed in URL - adding anyway to prevent binary/octet-stream")
     
-    # Check if URL requires CRC32 checksum (AWS SDK generated URLs often include this)
-    if 'x-amz-checksum-crc32' in query_params or 'x-amz-sdk-checksum-algorithm' in query_params:
-        # Calculate CRC32 checksum
-        crc32_value = zlib.crc32(body) & 0xffffffff
-        crc32_b64 = base64.b64encode(crc32_value.to_bytes(4, 'big')).decode('utf-8')
-        headers['x-amz-checksum-crc32'] = crc32_b64
-        headers['x-amz-sdk-checksum-algorithm'] = 'CRC32'
-        logger.info(f"Added CRC32 checksum to upload: {crc32_b64}")
+    # DO NOT add checksum headers - they are already in the URL query params if needed
+    # Adding them as headers when they weren't signed will cause AccessDenied error
     
     # Retry logic with exponential backoff
     last_exception = None
@@ -1546,17 +1627,29 @@ async def upload_to_user_presigned_url(result: dict, presigned_url: str, max_ret
                 if response.status_code in [200, 201]:
                     logger.info(f"✅ Successfully uploaded result to user-provided URL (attempt {attempt + 1})")
                     return presigned_url
-                elif response.status_code == 403 and 'SignatureDoesNotMatch' in response.text:
-                    # Signature error - could be transient or URL issue, worth retrying
-                    logger.warning(f"⚠️  SignatureDoesNotMatch error on attempt {attempt + 1}/{max_retries}")
-                    if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt
-                        logger.info(f"Waiting {wait_time}s before retry...")
-                        await asyncio.sleep(wait_time)
-                        continue
+                elif response.status_code == 403:
+                    response_text = response.text
+                    # Check for specific AWS error conditions
+                    if 'Request has expired' in response_text or 'expired' in response_text.lower():
+                        # Presigned URL has expired - don't retry, this is a permanent error
+                        logger.error(f"❌ PRESIGNED URL EXPIRED: The presigned URL has expired. Job waited too long in queue or URL TTL was too short.")
+                        logger.error(f"   Response: {response_text[:500]}")
+                        raise HTTPException(500, "Presigned URL expired - URL TTL must be longer than max queue wait time + processing time")
+                    elif 'SignatureDoesNotMatch' in response_text:
+                        # Signature error - could be transient or URL issue, worth retrying
+                        logger.warning(f"⚠️  SignatureDoesNotMatch error on attempt {attempt + 1}/{max_retries}")
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt
+                            logger.info(f"Waiting {wait_time}s before retry...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            logger.error(f"❌ SignatureDoesNotMatch persists after {max_retries} attempts: {response_text[:500]}")
+                            raise HTTPException(500, f"AWS signature error after {max_retries} retries - check presigned URL generation")
                     else:
-                        logger.error(f"❌ SignatureDoesNotMatch persists after {max_retries} attempts: {response.text[:500]}")
-                        raise HTTPException(500, f"AWS signature error after {max_retries} retries - check presigned URL generation")
+                        # Other 403 errors
+                        logger.error(f"❌ Access denied (403): {response_text[:500]}")
+                        raise HTTPException(500, f"Access denied to presigned URL: {response_text[:200]}")
                 elif 400 <= response.status_code < 500:
                     # Other client errors (4xx) - don't retry, fail immediately
                     logger.error(f"❌ Client error uploading to user URL (HTTP {response.status_code}): {response.text[:500]}")
@@ -1645,7 +1738,7 @@ async def _background_task_wrapper(coro):
 async def process_transcription_background(
     job_id: str,
     temp_audio_path: Optional[str],
-    upload_presigned_url: str,
+    upload_presigned_url: Optional[str],
     enable_diarization: bool,
     language: str,
     batch_size: int,
@@ -1672,7 +1765,9 @@ async def process_transcription_background(
     - Structured processing: Download → Process → Upload
     - Progress updates: "Downloading", "Transcribing", "Uploading", "Done"
     - Error uploads: Failed jobs still upload error details to user URL
-    - Automatic cleanup: Removes job records older than 1 hour
+    - Automatic cleanup: Removes completed/failed job records older than 12 hours
+    - Safe cleanup: Never removes current job or jobs still processing
+    - Presigned URL expiration detection with clear error messages
     """
     start_time = time.time()
     
@@ -1683,6 +1778,7 @@ async def process_transcription_background(
                 "status": "processing",
                 "progress": "Initializing",
                 "start_time": start_time,
+                "timeout_at": start_time + JOB_PROCESSING_TIMEOUT_SECONDS if JOB_PROCESSING_TIMEOUT_SECONDS > 0 else None,
                 "input_source": "file" if temp_audio_path else ("s3_url" if s3_presigned_url else "storage_key")
             }
         
@@ -1690,6 +1786,10 @@ async def process_transcription_background(
         
         # STEP 1: Download audio if needed (outside GPU - I/O bound)
         if not temp_audio_path:
+            # Check timeout
+            if JOB_PROCESSING_TIMEOUT_SECONDS > 0 and time.time() - start_time > JOB_PROCESSING_TIMEOUT_SECONDS:
+                raise TimeoutError(f"Job exceeded maximum processing time of {JOB_PROCESSING_TIMEOUT_SECONDS}s")
+            
             async with job_lock:
                 active_jobs[job_id]["progress"] = "Downloading audio"
                 active_jobs[job_id]["status"] = "processing"
@@ -1703,29 +1803,42 @@ async def process_transcription_background(
                 temp_audio_path = await download_from_r2(bucket, storage_key)
         
         # STEP 2: Process transcription with GPU
+        # Check timeout before starting GPU work
+        if JOB_PROCESSING_TIMEOUT_SECONDS > 0 and time.time() - start_time > JOB_PROCESSING_TIMEOUT_SECONDS:
+            raise TimeoutError(f"Job exceeded maximum processing time of {JOB_PROCESSING_TIMEOUT_SECONDS}s")
+        
         async with job_lock:
             active_jobs[job_id]["progress"] = "Transcribing audio"
             active_jobs[job_id]["status"] = "processing"
         
         logger.info(f"🎙️ Transcribing audio for job {job_id}...")
-        result = await server.transcribe_with_diarization(
-            temp_audio_path, 
-            enable_diarization=enable_diarization,
-            language=language,
-            model="large-v3-turbo",
-            batch_size=batch_size,
-            prompt=prompt,
-            temperature=0.0,
-            timestamp_granularities=timestamp_granularities,
-            output_content=output_content,
-            clustering_threshold=clustering_threshold,
-            segmentation_threshold=segmentation_threshold,
-            min_speaker_duration=min_speaker_duration,
-            speaker_confidence_threshold=speaker_confidence_threshold,
-            speaker_smoothing_enabled=speaker_smoothing_enabled,
-            min_switch_duration=min_switch_duration,
-            vad_validation_enabled=vad_validation_enabled,
-            optimized_alignment=optimized_alignment
+        # Run GPU transcription in thread pool to allow concurrent GPU processing
+        # This offloads blocking GPU calls from event loop, enabling multiple jobs to process simultaneously
+        # 
+        # IMPORTANT: output_content parameter controls what gets uploaded to AWS
+        # The inline API response is ALWAYS metadata-only for async mode (handled at endpoint level)
+        # But the AWS upload respects user's output_content choice
+        result = await asyncio.get_event_loop().run_in_executor(
+            gpu_executor,
+            lambda: server.transcribe_with_diarization(
+                temp_audio_path, 
+                enable_diarization=enable_diarization,
+                language=language,
+                model="large-v3-turbo",
+                batch_size=batch_size,
+                prompt=prompt,
+                temperature=0.0,
+                timestamp_granularities=timestamp_granularities,
+                output_content=output_content,  # User's choice - controls AWS upload content
+                clustering_threshold=clustering_threshold,
+                segmentation_threshold=segmentation_threshold,
+                min_speaker_duration=min_speaker_duration,
+                speaker_confidence_threshold=speaker_confidence_threshold,
+                speaker_smoothing_enabled=speaker_smoothing_enabled,
+                min_switch_duration=min_switch_duration,
+                vad_validation_enabled=vad_validation_enabled,
+                optimized_alignment=optimized_alignment
+            )
         )
         
         # Add job ID and timing to result
@@ -1735,50 +1848,139 @@ async def process_transcription_background(
             result["processing_time"] = time.time() - start_time
         
         # STEP 3: Upload result (outside GPU - I/O bound)
+        # Check timeout before uploading
+        if JOB_PROCESSING_TIMEOUT_SECONDS > 0 and time.time() - start_time > JOB_PROCESSING_TIMEOUT_SECONDS:
+            raise TimeoutError(f"Job exceeded maximum processing time of {JOB_PROCESSING_TIMEOUT_SECONDS}s")
+        
         async with job_lock:
-            active_jobs[job_id]["progress"] = "Uploading results"
-            active_jobs[job_id]["status"] = "processing"
+            if job_id in active_jobs:
+                active_jobs[job_id]["progress"] = "Uploading results"
+                active_jobs[job_id]["status"] = "processing"
+            else:
+                logger.warning(f"⚠️ Job {job_id} was removed from active_jobs before upload phase")
         
         logger.info(f"📤 Uploading results for job {job_id}...")
-        await upload_to_user_presigned_url(result, upload_presigned_url)
+        
+        # ALWAYS store result locally for retrieval via GET endpoint (if retention is enabled)
+        if JOB_RESULT_RETENTION_SECONDS > 0:
+            try:
+                save_job_result_local(job_id, result)
+                logger.info(f"✅ Stored result locally for GET retrieval")
+            except Exception as storage_error:
+                logger.error(f"⚠️ Failed to store result locally (GET endpoint won't work): {storage_error}")
+                # Don't fail the job if local storage fails - continue with callback upload
+        
+        # Upload to user's presigned URL if provided (optional callback)
+        if upload_presigned_url:
+            await upload_to_user_presigned_url(result, upload_presigned_url)
+        else:
+            logger.info(f"✅ No callback URL provided, results stored locally only")
         
         # Mark job as completed
         end_time = time.time()
         async with job_lock:
-            active_jobs[job_id]["status"] = "completed"
-            active_jobs[job_id]["progress"] = "Done"
-            active_jobs[job_id]["end_time"] = end_time
-            active_jobs[job_id]["elapsed_time"] = end_time - start_time
+            if job_id in active_jobs:
+                active_jobs[job_id]["status"] = "completed"
+                active_jobs[job_id]["progress"] = "Done"
+                active_jobs[job_id]["end_time"] = end_time
+                active_jobs[job_id]["elapsed_time"] = end_time - start_time
+                if JOB_RESULT_RETENTION_SECONDS > 0:
+                    active_jobs[job_id]["result_available"] = True
+                    active_jobs[job_id]["result_expires_at"] = end_time + JOB_RESULT_RETENTION_SECONDS
+            else:
+                logger.warning(f"⚠️ Job {job_id} was removed from active_jobs before marking complete")
         
         logger.info(f"✅ Background job {job_id} completed successfully in {end_time - start_time:.2f}s")
         
+    except TimeoutError as e:
+        end_time = time.time()
+        logger.error(f"⏱️ Background job {job_id} TIMEOUT after {end_time - start_time:.2f}s: {e}")
+        
+        # Create timeout error result
+        error_result = {
+            "job_id": job_id,
+            "status": "failed",
+            "error": f"Job exceeded maximum processing time of {JOB_PROCESSING_TIMEOUT_SECONDS}s ({JOB_PROCESSING_TIMEOUT_SECONDS/3600:.1f} hours)",
+            "error_type": "TimeoutError",
+            "processing_time": end_time - start_time,
+            "timeout_limit": JOB_PROCESSING_TIMEOUT_SECONDS
+        }
+        
+        # Store timeout error result locally for GET retrieval (if retention is enabled)
+        if JOB_RESULT_RETENTION_SECONDS > 0:
+            try:
+                save_job_result_local(job_id, error_result)
+                logger.info(f"✅ Stored timeout error result locally for GET retrieval")
+            except Exception as storage_error:
+                logger.error(f"⚠️ Failed to store timeout error result locally: {storage_error}")
+        
+        # Update job status to failed
+        async with job_lock:
+            if job_id in active_jobs:
+                active_jobs[job_id]["status"] = "failed"
+                active_jobs[job_id]["progress"] = "Timeout"
+                active_jobs[job_id]["end_time"] = end_time
+                active_jobs[job_id]["elapsed_time"] = end_time - start_time
+                active_jobs[job_id]["error"] = error_result["error"]
+                active_jobs[job_id]["error_type"] = "TimeoutError"
+                if JOB_RESULT_RETENTION_SECONDS > 0:
+                    active_jobs[job_id]["result_available"] = True
+                    active_jobs[job_id]["result_expires_at"] = end_time + JOB_RESULT_RETENTION_SECONDS
+            else:
+                logger.warning(f"⚠️ Job {job_id} was removed from active_jobs before marking timeout")
+        
+        # Try to upload timeout error result to user's URL if provided
+        if upload_presigned_url:
+            try:
+                await upload_to_user_presigned_url(error_result, upload_presigned_url)
+                logger.info(f"📤 Uploaded timeout error result for job {job_id}")
+            except Exception as upload_error:
+                logger.error(f"❌ Failed to upload timeout error result for job {job_id}: {upload_error}")
+    
     except Exception as e:
         end_time = time.time()
         logger.error(f"❌ Background job {job_id} failed after {end_time - start_time:.2f}s: {e}")
         logger.error(traceback.format_exc())
         
+        # Create error result
+        error_result = {
+            "job_id": job_id,
+            "status": "failed",
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "processing_time": end_time - start_time
+        }
+        
+        # Store error result locally for GET retrieval (if retention is enabled)
+        if JOB_RESULT_RETENTION_SECONDS > 0:
+            try:
+                save_job_result_local(job_id, error_result)
+                logger.info(f"✅ Stored error result locally for GET retrieval")
+            except Exception as storage_error:
+                logger.error(f"⚠️ Failed to store error result locally: {storage_error}")
+        
         # Update job status to failed
         async with job_lock:
-            active_jobs[job_id]["status"] = "failed"
-            active_jobs[job_id]["progress"] = "Failed"
-            active_jobs[job_id]["end_time"] = end_time
-            active_jobs[job_id]["elapsed_time"] = end_time - start_time
-            active_jobs[job_id]["error"] = str(e)
-            active_jobs[job_id]["error_type"] = type(e).__name__
+            if job_id in active_jobs:
+                active_jobs[job_id]["status"] = "failed"
+                active_jobs[job_id]["progress"] = "Failed"
+                active_jobs[job_id]["end_time"] = end_time
+                active_jobs[job_id]["elapsed_time"] = end_time - start_time
+                active_jobs[job_id]["error"] = str(e)
+                active_jobs[job_id]["error_type"] = type(e).__name__
+                if JOB_RESULT_RETENTION_SECONDS > 0:
+                    active_jobs[job_id]["result_available"] = True
+                    active_jobs[job_id]["result_expires_at"] = end_time + JOB_RESULT_RETENTION_SECONDS
+            else:
+                logger.warning(f"⚠️ Job {job_id} was removed from active_jobs before marking failed")
         
-        # Try to upload error result to user's URL
-        try:
-            error_result = {
-                "job_id": job_id,
-                "status": "failed",
-                "error": str(e),
-                "error_type": type(e).__name__,
-                "processing_time": end_time - start_time
-            }
-            await upload_to_user_presigned_url(error_result, upload_presigned_url)
-            logger.info(f"📤 Uploaded error result for job {job_id}")
-        except Exception as upload_error:
-            logger.error(f"❌ Failed to upload error result for job {job_id}: {upload_error}")
+        # Try to upload error result to user's URL if provided
+        if upload_presigned_url:
+            try:
+                await upload_to_user_presigned_url(error_result, upload_presigned_url)
+                logger.info(f"📤 Uploaded error result for job {job_id}")
+            except Exception as upload_error:
+                logger.error(f"❌ Failed to upload error result for job {job_id}: {upload_error}")
     
     finally:
         # Cleanup temporary files
@@ -1789,19 +1991,46 @@ async def process_transcription_background(
             except Exception as cleanup_error:
                 logger.warning(f"⚠️ Failed to cleanup temporary file {temp_audio_path}: {cleanup_error}")
         
-        # Cleanup old job records (older than 1 hour)
+        # Cleanup old job records and result files
+        # CRITICAL: Don't remove jobs that are still processing or just completed
         try:
             async with job_lock:
                 current_time = time.time()
+                # Use configured retention period for cleanup
+                retention_seconds = JOB_RESULT_RETENTION_SECONDS if JOB_RESULT_RETENTION_SECONDS > 0 else 43200
+                
+                # Only cleanup jobs that are completed/failed AND old
                 jobs_to_remove = [
                     jid for jid, job_data in active_jobs.items()
-                    if current_time - job_data.get("start_time", current_time) > 3600
+                    if (
+                        jid != job_id  # Never remove the current job
+                        and job_data.get("status") in ["completed", "failed"]  # Only cleanup finished jobs
+                        and current_time - job_data.get("start_time", current_time) > retention_seconds
+                    )
                 ]
                 for jid in jobs_to_remove:
                     del active_jobs[jid]
                     logger.debug(f"🗑️ Removed old job record: {jid}")
+                
+                if jobs_to_remove:
+                    logger.info(f"🗑️ Cleaned up {len(jobs_to_remove)} old job records")
+            
+            # Clean up old result files from filesystem
+            cleanup_old_job_results()
         except Exception as cleanup_error:
             logger.warning(f"⚠️ Failed to cleanup old job records: {cleanup_error}")
+
+async def periodic_cleanup_task():
+    """Background task to periodically clean up old job results"""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Run every hour
+            logger.info("🧹 Running periodic cleanup of old job results...")
+            cleanup_count = cleanup_old_job_results()
+            if cleanup_count > 0:
+                logger.info(f"🧹 Periodic cleanup removed {cleanup_count} old result(s)")
+        except Exception as e:
+            logger.error(f"❌ Error in periodic cleanup task: {e}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -1809,6 +2038,11 @@ async def startup_event():
     try:
         init_storage_clients()
         server.load_models()
+        
+        # Start periodic cleanup task
+        if JOB_RESULT_RETENTION_SECONDS > 0:
+            asyncio.create_task(periodic_cleanup_task())
+            logger.info(f"🧹 Started periodic cleanup task (retention: {JOB_RESULT_RETENTION_SECONDS}s)")
     except Exception as e:
         logger.error(f"Failed to load models on startup: {e}")
 
@@ -1849,55 +2083,58 @@ async def health_check():
         "storage_clients": {
             "r2_enabled": r2_client is not None,
             "s3_enabled": s3_client is not None
-        },
-        "features": [
-            "Advanced speaker diarization with confidence scoring",
-            "Multi-cloud storage support (R2, S3)",
-            "GPU-accelerated processing pipeline",
-            "Automatic result export to cloud storage",
-            "Pre-signed S3 URL support",
-            "Direct R2 upload functionality",
-            "Optimized clustering and segmentation",
-            "Multi-criteria speaker validation",
-            "GPU batch processing optimization",
-            "Comprehensive error handling and cleanup",
-            "Job status tracking and monitoring",
-            "Enhanced upload retry logic with exponential backoff"
-        ]
+        }
     }
 
 @app.get("/v1/jobs/{job_id}")
-async def get_job_status(job_id: str):
+async def get_job_status(job_id: str, include_result: bool = True):
     """
-    Get status of a specific transcription job
+    Get status and results of a specific transcription job
     
-    Returns job status, progress, timing information, and error details if failed.
-    Job records are automatically cleaned up after 1 hour.
+    Returns job status, progress, timing information, and full transcription results if completed.
+    Job records and results are automatically cleaned up based on JOB_RESULT_RETENTION_SECONDS.
     
     **Parameters:**
     - `job_id`: The unique job identifier returned when starting an async transcription
+    - `include_result`: If true (default), includes full transcription results when job is completed
     
     **Returns:**
     - Job status and progress information
     - Timing details (start time, elapsed time, end time if completed)
+    - Full transcription results (if job completed and include_result=true)
     - Error information if the job failed
     
-    **Response Example:**
+    **Response Example (Processing):**
     ```json
     {
       "job_id": "abc123...",
-      "status": "processing|completed|failed",
+      "status": "processing",
       "progress": "Transcribing audio",
       "start_time": 1234567890.123,
-      "elapsed_time": 45.2,
-      "end_time": 1234567935.3,
-      "error": "Error message if failed"
+      "elapsed_time": 45.2
+    }
+    ```
+    
+    **Response Example (Completed):**
+    ```json
+    {
+      "job_id": "abc123...",
+      "status": "completed",
+      "progress": "Done",
+      "start_time": 1234567890.123,
+      "elapsed_time": 120.5,
+      "end_time": 1234568010.623,
+      "result": {
+        "text": "Full transcription...",
+        "segments": [...],
+        "language": "en"
+      }
     }
     ```
     """
     async with job_lock:
         if job_id not in active_jobs:
-            raise HTTPException(404, f"Job not found: {job_id}. Note: Job records are automatically cleaned up after 1 hour.")
+            raise HTTPException(404, f"Job not found: {job_id}. Note: Job records are automatically cleaned up after completion based on retention settings.")
         
         job_data = active_jobs[job_id].copy()
     
@@ -1906,6 +2143,22 @@ async def get_job_status(job_id: str):
         job_data["elapsed_time"] = time.time() - job_data["start_time"]
     
     job_data["job_id"] = job_id
+    
+    # If job is completed/failed and result storage is enabled, try to load the full result
+    if include_result and job_data.get("status") in ["completed", "failed"] and JOB_RESULT_RETENTION_SECONDS > 0:
+        try:
+            full_result = load_job_result_local(job_id)
+            if full_result:
+                # Merge the stored result with job metadata
+                # Keep job tracking data, but add the full transcription result
+                job_data["result"] = full_result
+                logger.debug(f"✅ Loaded full result for job {job_id}")
+            else:
+                job_data["result_note"] = "Result not available (may have been cleaned up or failed to store)"
+        except Exception as e:
+            logger.error(f"❌ Error loading result for job {job_id}: {e}")
+            job_data["result_note"] = f"Error loading result: {str(e)}"
+    
     return job_data
 
 @app.get("/v1/jobs")
@@ -2112,7 +2365,7 @@ async def create_transcription(
     speaker_smoothing_enabled: bool = Form(True, description="Enable speaker transition smoothing"),
     min_switch_duration: float = Form(2.0, description="Minimum time between speaker switches (seconds)"),
     vad_validation_enabled: bool = Form(False, description="Enable Voice Activity Detection validation (experimental)"),
-    optimized_alignment: bool = Form(True, description="Use WAV2VEC2 alignment model (True) or Whisper built-in alignment (False) - False is faster")
+    optimized_alignment: bool = Form(True, description="Use WAV2VEC2 alignment model (True) or Whisper built-in alignment (False) - True provides best accuracy")
 ):
     """
     **Advanced Audio Transcription with Speaker Identification**
@@ -2134,25 +2387,27 @@ async def create_transcription(
       - `timestamps_only`: Returns JSON with timestamps and segments (no separate text field)
       - `both`: Returns both plain text AND timestamped segments (default)
       - `metadata_only`: Returns only processing metadata (no transcription text)
-    - `stored_output`: Enable/disable result storage (false = API response only)
-    - `upload_presigned_url`: Upload to your own S3 bucket (enables async mode)
-    - `output_key`: Custom storage object key (auto-generated if not provided)
+    - `stored_output`: **Controls processing mode** (true = async with storage, false = sync with inline results)
+    - `upload_presigned_url`: Optional callback URL to upload results to your S3 bucket
+    - `output_key`: [Deprecated] No longer used (kept for backward compatibility)
     
     **⚡ Processing Modes:**
-    - **Async Mode** (when `upload_presigned_url` is provided):
-      - Returns immediately with job status and metadata
+    - **Async Mode** (when `stored_output=true`):
+      - Returns immediately with `job_id` and metadata
       - Processes transcription in background
-      - Uploads result to your S3 bucket when complete
-      - Use S3 event notifications (Lambda) to detect completion
-    - **Sync Mode** (when `upload_presigned_url` is NOT provided):
+      - Results stored locally on server for 24 hours (configurable)
+      - Retrieve results via `GET /v1/jobs/{job_id}`
+      - Optional: Also uploads to `upload_presigned_url` if provided
+    - **Sync Mode** (when `stored_output=false`):
       - Waits for transcription to complete
-      - Returns full result in API response
-      - Optionally stores result if `stored_output` is true
+      - Returns full result inline in API response
+      - Respects `response_format` and `output_content` parameters
+      - No server-side storage
     
-    **Output Logic (Sync Mode):**
-    - If `stored_output` is `false`: Results returned in API response only
-    - If `stored_output` is `true`:
-      - Upload to server's downloads bucket (retrievable via /v1/downloads endpoint)
+    **Retrieval Options:**
+    - **Polling** (async mode): Submit job, get `job_id`, poll `GET /v1/jobs/{job_id}` for results
+    - **Callback** (async mode with `upload_presigned_url`): Results uploaded to your S3, also retrievable via GET endpoint
+    - **Inline** (sync mode): Immediate response with full transcription results
     
     **⚙️ Transcription Settings:**
     - Multi-language support with automatic detection
@@ -2180,9 +2435,9 @@ async def create_transcription(
         logger.info(f"🚀 Request started at {start_time}")
 
         # Check for async mode FIRST before any processing
+        # Async mode is triggered by stored_output=true (results stored locally for later retrieval)
         # This allows immediate response instead of waiting for downloads or form processing
-        is_async_mode = bool(upload_presigned_url)
-        logger.info(f"⚡ Async mode check took {time.time() - start_time:.3f}s - Async: {is_async_mode}")
+        is_async_mode = stored_output
 
         # Handle legacy parameters if provided (model, temperature) - these are ignored but logged
         # Only process form data if NOT in async mode to avoid blocking the response
@@ -2209,8 +2464,6 @@ async def create_transcription(
         if ignored_params:
             logger.info(f"ℹ️  Ignored parameters in this request: {', '.join(ignored_params)}")
 
-        logger.info(f"🔍 Input validation start at {time.time() - start_time:.3f}s")
-
         # Validate input parameters
         file_provided = file is not None and file.filename is not None and file.filename.strip() != ""
         input_sources = sum([
@@ -2224,18 +2477,19 @@ async def create_transcription(
         elif input_sources > 1:
             raise HTTPException(400, "Only one input source allowed at a time")
 
-        logger.info(f"✅ Input validation took {time.time() - start_time:.3f}s - Sources: {input_sources}")
-        
-        logger.info(f"🔄 Input source handling start at {time.time() - start_time:.3f}s")
-
         # Handle different input sources
         if file:
-            # Direct file upload
-            logger.info("Processing direct file upload")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-                temp_audio_path = temp_file.name
-                shutil.copyfileobj(file.file, temp_file)
-            logger.info(f"File saved to {temp_audio_path}")
+            # Direct file upload - use async file I/O to avoid blocking event loop
+            temp_audio_path = tempfile.mktemp(suffix=".wav")
+            
+            # Read file content asynchronously to avoid blocking
+            content = await file.read()
+            
+            # Write to temp file in thread pool to avoid blocking event loop
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: Path(temp_audio_path).write_bytes(content)
+            )
 
         elif storage_key:
             # Storage object download from configured bucket
@@ -2257,28 +2511,24 @@ async def create_transcription(
                 temp_audio_path = None  # Background task will download
             else:
                 # SYNC MODE: Download now
-                logger.info(f"Processing pre-signed URL: {s3_presigned_url[:50]}...")
                 temp_audio_path = await download_from_s3_presigned(s3_presigned_url)
 
-        logger.info(f"✅ Input source handling took {time.time() - start_time:.3f}s")
-        
-        logger.info(f"🎯 Async response start at {time.time() - start_time:.3f}s")
-
-        # ASYNC PROCESSING MODE: If upload_presigned_url is provided, return immediately
-        if upload_presigned_url:
+        # ASYNC PROCESSING MODE: If stored_output=true, return immediately with job_id
+        # Results will be stored locally and retrievable via GET /v1/jobs/{job_id}
+        if stored_output:
             # Generate unique job ID
             job_id = str(uuid.uuid4())
 
             logger.info(f"🚀 Starting async transcription job {job_id}")
-            logger.info(f"   Will upload results to user-provided presigned URL")
+            logger.info(f"   Results will be stored locally for retrieval")
+            if upload_presigned_url:
+                logger.info(f"   Will also upload results to user-provided presigned URL")
 
             # Prepare timestamp granularities for response
             granularities = [g.strip().lower() for g in timestamp_granularities.split(',')]
 
-            logger.info(f"📋 Background task setup start at {time.time() - start_time:.3f}s")
-
-            # Start background processing using asyncio.create_task for true decoupling
-            # This ensures the HTTP connection closes immediately without waiting for the task
+            # Use asyncio.create_task for TRUE parallel GPU processing
+            # Multiple transcription jobs WILL run concurrently on the GPU
             asyncio.create_task(
                 process_transcription_background(
                     job_id=job_id,
@@ -2303,16 +2553,15 @@ async def create_transcription(
                 )
             )
 
-            logger.info(f"✅ Background task setup took {time.time() - start_time:.3f}s")
-
-            # Return immediate response with job metadata
-            response_time = time.time() - start_time
-            logger.info(f"⚡ RETURNING ASYNC RESPONSE at {response_time:.3f}s")
-
-            return {
+            # Build response message based on configuration
+            response_message = f"Transcription job started. Results will be stored locally and retrievable via GET /v1/jobs/{job_id}"
+            if JOB_RESULT_RETENTION_SECONDS > 0:
+                response_message += f" for {JOB_RESULT_RETENTION_SECONDS / 3600:.1f} hours."
+            
+            response_data = {
                 "job_id": job_id,
                 "status": "in_progress",
-                "message": "Transcription job started. Results will be uploaded to your S3 bucket when complete.",
+                "message": response_message,
                 "processing_info": {
                     "device": server.device,
                     "language": language,
@@ -2320,82 +2569,50 @@ async def create_transcription(
                     "diarization_enabled": enable_diarization,
                     "optimized_alignment": optimized_alignment
                 },
-                "storage_info": {
-                    "uploaded": False,
-                    "storage_url": upload_presigned_url,
-                    "key": "user-specified",
-                    "service": "User S3 Bucket",
-                    "notification": "Use S3 event notifications to detect when the result file is uploaded"
+                "retrieval_info": {
+                    "method": "GET /v1/jobs/{job_id}",
+                    "retention_seconds": JOB_RESULT_RETENTION_SECONDS,
+                    "note": "Poll this endpoint to check status and retrieve results when complete"
                 }
             }
+            
+            # Add S3 upload info if presigned URL provided
+            if upload_presigned_url:
+                response_data["callback_info"] = {
+                    "upload_url": upload_presigned_url,
+                    "note": "Results will also be uploaded to your S3 bucket when complete"
+                }
+            
+            return response_data
         
         # SYNCHRONOUS PROCESSING MODE: Process transcription and wait for completion
-        result = await server.transcribe_with_diarization(
-            temp_audio_path, 
-            enable_diarization=enable_diarization,
-            language=language,
-            model="large-v3-turbo",  # Performance optimized model
-            batch_size=batch_size,
-            prompt=prompt,
-            temperature=0.0,  # Always use 0.0 (ignored parameters handled above)
-            timestamp_granularities=timestamp_granularities,
-            output_content=output_content,
-            clustering_threshold=clustering_threshold,
-            segmentation_threshold=segmentation_threshold,
-            min_speaker_duration=min_speaker_duration,
-            speaker_confidence_threshold=speaker_confidence_threshold,
-            speaker_smoothing_enabled=speaker_smoothing_enabled,
-            min_switch_duration=min_switch_duration,
-            vad_validation_enabled=vad_validation_enabled,
-            optimized_alignment=optimized_alignment
+        # Run GPU transcription in thread pool to allow concurrent GPU processing
+        result = await asyncio.get_event_loop().run_in_executor(
+            gpu_executor,
+            lambda: server.transcribe_with_diarization(
+                temp_audio_path, 
+                enable_diarization=enable_diarization,
+                language=language,
+                model="large-v3-turbo",  # Performance optimized model
+                batch_size=batch_size,
+                prompt=prompt,
+                temperature=0.0,  # Always use 0.0 (ignored parameters handled above)
+                timestamp_granularities=timestamp_granularities,
+                output_content=output_content,
+                clustering_threshold=clustering_threshold,
+                segmentation_threshold=segmentation_threshold,
+                min_speaker_duration=min_speaker_duration,
+                speaker_confidence_threshold=speaker_confidence_threshold,
+                speaker_smoothing_enabled=speaker_smoothing_enabled,
+                min_switch_duration=min_switch_duration,
+                vad_validation_enabled=vad_validation_enabled,
+                optimized_alignment=optimized_alignment
+            )
         )
         
-        # Handle output to storage based on user's requirements:
-        # IF stored_output IS TRUE, THEN
-        #   IF upload_presigned_URL IS TRUE, THEN output to upload_presigned_URL
-        #   ELSE output to downloads bucket (defined in /downloads endpoint)
-        # ELSE provide response within API call
-        storage_url = None
-        
-        if stored_output:
-            # User wants stored output
-            if upload_presigned_url:
-                # Priority 1: Upload to user's pre-signed URL
-                storage_url = await upload_to_user_presigned_url(result, upload_presigned_url)
-                service_name = "User S3 Bucket"
-                bucket_info = upload_presigned_url
-                key_info = "user-specified"
-            else:
-                # Priority 2: Upload to downloads bucket (default server storage)
-                if not output_key:
-                    # Auto-generate output key if not provided
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                    output_key = f"transcriptions/{timestamp}_result.json"
-                    logger.info(f"Auto-generated output key: {output_key}")
-                
-                bucket = DEFAULT_RESULTS_BUCKET
-                storage_url = await upload_result_to_storage(
-                    result, 
-                    bucket, 
-                    output_key, 
-                    use_r2=True  # Use primary storage (downloads bucket)
-                )
-                service_name = "Downloads Bucket"
-                bucket_info = bucket
-                key_info = output_key
-        # If stored_output is False, don't store anything - just return API response
-        
-        # Add storage info to result if upload occurred
-        if storage_url:
-            # Ensure result has the right structure for adding storage info
-            if isinstance(result, dict):
-                result["storage_info"] = {
-                    "uploaded": True,
-                    "storage_url": storage_url,
-                    "bucket": bucket_info,
-                    "key": key_info,
-                    "service": service_name
-                }
+        # SYNCHRONOUS MODE: Return results inline based on response_format and output_content
+        # No storage happens in sync mode - results are returned directly in API response
+        # (stored_output=false means sync mode with inline results)
         
         if response_format == "json":
             return result
@@ -2439,7 +2656,7 @@ async def create_transcription(
     finally:
         # Cleanup temporary files ONLY in sync mode
         # In async mode, the background task will clean up after processing
-        if temp_audio_path and os.path.exists(temp_audio_path) and not upload_presigned_url:
+        if temp_audio_path and os.path.exists(temp_audio_path) and not stored_output:
             try:
                 os.unlink(temp_audio_path)
                 logger.debug(f"Cleaned up temporary audio file: {temp_audio_path}")
