@@ -42,6 +42,25 @@ from concurrent.futures import ThreadPoolExecutor
 load_dotenv()
 load_dotenv("working_gpu.env")  # Load specific config for working GPU server
 
+# Early CUDA initialization to catch GPU issues before server starts
+# This is critical for H100 and other high-end GPUs
+if torch.cuda.is_available():
+    try:
+        print(f"Initializing CUDA device 0...")
+        torch.cuda.set_device(0)
+        # Force CUDA context creation with a small operation
+        test_tensor = torch.zeros(1, device='cuda')
+        torch.cuda.synchronize()
+        del test_tensor
+        torch.cuda.empty_cache()
+        print(f"✓ CUDA initialized successfully: {torch.cuda.get_device_name(0)}")
+        print(f"✓ CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    except Exception as e:
+        print(f"⚠ WARNING: CUDA initialization failed: {e}")
+        print(f"⚠ Server will attempt to use CPU mode")
+else:
+    print("ℹ CUDA not available - running in CPU mode")
+
 # Initialize R2/S3 clients
 r2_client = None
 s3_client = None
@@ -144,7 +163,23 @@ class WhisperXDiarizationServer:
     """
     
     def __init__(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Initialize CUDA properly before checking availability (critical for H100)
+        if torch.cuda.is_available():
+            try:
+                # Force CUDA initialization and context creation
+                torch.cuda.init()
+                torch.cuda.set_device(0)
+                # Create a small tensor to force CUDA context creation
+                _ = torch.zeros(1).cuda()
+                torch.cuda.synchronize()
+                self.device = "cuda"
+                logger.info("CUDA initialized successfully")
+            except Exception as e:
+                logger.warning(f"CUDA initialization failed: {e}, falling back to CPU")
+                self.device = "cpu"
+        else:
+            self.device = "cpu"
+            
         self.compute_type = "float32"  # Safe for GPU
         self.transcription_model = None
         self.alignment_model = None
@@ -182,6 +217,17 @@ class WhisperXDiarizationServer:
     def load_models(self):
         """Load models with error handling"""
         try:
+            # Ensure CUDA is ready before loading models
+            if self.device == "cuda":
+                logger.info("Verifying CUDA readiness before model loading...")
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    logger.info(f"CUDA device {torch.cuda.current_device()} ready: {torch.cuda.get_device_name(0)}")
+                except Exception as e:
+                    logger.error(f"CUDA verification failed: {e}")
+                    raise
+            
             # Load transcription model
             logger.info("Loading WhisperX transcription model...")
             self.transcription_model = whisperx.load_model(

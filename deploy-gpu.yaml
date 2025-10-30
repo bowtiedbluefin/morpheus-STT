@@ -11,12 +11,13 @@ version: "2.0"
 
 services:
   whisper-api:
-    image: kylecohen01/whisper-transcription-api:4.14
+    image: kylecohen01/whisper-transcription-api:5.13
     expose:
       - port: 3333
         as: 80
         to:
           - global: true
+        proto: tcp
         http_options:
           max_body_size: 4294967295
           read_timeout: 3600000  # 1 hour for large files (sync mode)
@@ -32,10 +33,42 @@ services:
           mount: /app/models
           readOnly: false
     env:
+      # =================================================================
+      # REQUIRED AUTHENTICATION
+      # =================================================================
       - PYTHONUNBUFFERED=1
       - HUGGINGFACE_TOKEN=your_token_here
       
-      # Advanced Diarization Configuration
+      # =================================================================
+      # GPU/CUDA INITIALIZATION (critical for H100 and high-end GPUs)
+      # =================================================================
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      - CUDA_LAUNCH_BLOCKING=0
+      
+      # =================================================================
+      # CLOUDFLARE R2 CONFIGURATION (Optional - for R2 storage)
+      # =================================================================
+      # Uncomment and set these for R2 functionality
+      # - R2_ENDPOINT=https://your_account_id.r2.cloudflarestorage.com
+      # - R2_ACCESS_KEY_ID=your_r2_access_key
+      # - R2_SECRET_ACCESS_KEY=your_r2_secret_key
+      # - DEFAULT_UPLOAD_BUCKET=default-uploads
+      # - DEFAULT_RESULTS_BUCKET=default-results
+      
+      # =================================================================
+      # AWS S3 CONFIGURATION (Optional - for S3 result export)
+      # =================================================================
+      # Only needed for automatic S3 result export
+      # Pre-signed URLs work WITHOUT these credentials
+      # - AWS_ACCESS_KEY_ID=your_aws_access_key
+      # - AWS_SECRET_ACCESS_KEY=your_aws_secret_key
+      # - AWS_DEFAULT_REGION=us-east-1
+      
+      # =================================================================
+      # ADVANCED DIARIZATION CONFIGURATION
+      # =================================================================
       - PYANNOTE_CLUSTERING_THRESHOLD=0.7
       - PYANNOTE_SEGMENTATION_THRESHOLD=0.45
       - SPEAKER_CONFIDENCE_THRESHOLD=0.6
@@ -44,21 +77,40 @@ services:
       - MIN_SWITCH_DURATION=2.0
       - VAD_VALIDATION_ENABLED=false
       
-      # Core WhisperX Configuration
+      # =================================================================
+      # CORE WHISPERX CONFIGURATION
+      # =================================================================
       - WHISPERX_COMPUTE_TYPE=float32
       - WHISPERX_BATCH_SIZE=16
       - WHISPERX_CHAR_ALIGN=false
       - USE_OPTIMIZED_ALIGNMENT=true
-      - MAX_CONCURRENT_REQUESTS=12
-      - MEMORY_PER_REQUEST_GB=1.0
       - WHISPERX_CHUNK_LENGTH=30
       - VAD_ONSET=0.500
       - VAD_OFFSET=0.200
       - ALIGN_MODEL=WAV2VEC2_ASR_LARGE_LV60K_960H
       - INTERPOLATE_METHOD=linear
       - SEGMENT_RESOLUTION=word
+      
+      # =================================================================
+      # CONCURRENCY & PERFORMANCE
+      # =================================================================
+      - MAX_CONCURRENT_REQUESTS=12
+      - MEMORY_PER_REQUEST_GB=1.0
       - ENABLE_REQUEST_QUEUING=true
       - QUEUE_TIMEOUT=600
+      
+      # =================================================================
+      # JOB PROCESSING & TIMEOUT CONFIGURATION
+      # =================================================================
+      - UPLOAD_TIMEOUT_SECONDS=3600
+      - JOB_PROCESSING_TIMEOUT_SECONDS=86400
+      - JOB_RESULT_RETENTION_SECONDS=86400
+      - JOB_RESULTS_DIR=/app/job-results
+      
+      # =================================================================
+      # SERVER CONFIGURATION
+      # =================================================================
+      - PORT=3333
 
 profiles:
   compute:
@@ -73,9 +125,11 @@ profiles:
           attributes:
             vendor:
               nvidia:
+                - model: h100
                 - model: rtx4090
                 - model: rtx3090
                 - model: a6000
+                - model: a4000
                 - model: v100
         storage:
           - size: 50Gi
@@ -90,10 +144,10 @@ profiles:
       pricing:
         whisper-api: 
           denom: uakt
-          amount: 6000
+          amount: 10000
 
 deployment:
   whisper-api:
     dcloud:
       profile: whisper-api
-      count: 1 
+      count: 1

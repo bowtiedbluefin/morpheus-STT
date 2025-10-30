@@ -32,6 +32,12 @@ ENV PYTHONPATH="/install/lib/python3.12/site-packages"
 # PyTorch CUDA library isolation 
 ENV LD_LIBRARY_PATH="/install/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/install/lib/python3.12/site-packages/nvidia/cudnn/lib:/install/lib/python3.12/site-packages/nvidia/cublas/lib:/install/lib/python3.12/site-packages/nvidia/cufft/lib:/install/lib/python3.12/site-packages/nvidia/curand/lib:/install/lib/python3.12/site-packages/nvidia/cusolver/lib:/install/lib/python3.12/site-packages/nvidia/cusparse/lib"
 
+# CUDA initialization and compatibility settings (critical for H100)
+ENV CUDA_LAUNCH_BLOCKING=0
+ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
+ENV CUDA_VISIBLE_DEVICES=0
+ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+
 # Install system dependencies 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
@@ -89,7 +95,13 @@ USER appuser
 COPY --from=builder /install /install
 COPY python_server.py .
 COPY env.example .
+COPY docker_entrypoint.sh .
+
+# Make entrypoint executable
+USER root
+RUN chmod +x docker_entrypoint.sh
+USER appuser
 
 # Expose port and run application
 EXPOSE 3333
-CMD ["python3", "python_server.py"] 
+ENTRYPOINT ["./docker_entrypoint.sh"] 
