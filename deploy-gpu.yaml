@@ -48,14 +48,19 @@ services:
       - CUDA_LAUNCH_BLOCKING=0
       
       # =================================================================
+      # STORAGE CONFIGURATION
+      # =================================================================
+      # Default storage buckets (always set, used with R2 or S3)
+      - DEFAULT_UPLOAD_BUCKET=default-uploads
+      - DEFAULT_RESULTS_BUCKET=default-results
+      
+      # =================================================================
       # CLOUDFLARE R2 CONFIGURATION (Optional - for R2 storage)
       # =================================================================
       # Uncomment and set these for R2 functionality
       # - R2_ENDPOINT=https://your_account_id.r2.cloudflarestorage.com
       # - R2_ACCESS_KEY_ID=your_r2_access_key
       # - R2_SECRET_ACCESS_KEY=your_r2_secret_key
-      # - DEFAULT_UPLOAD_BUCKET=default-uploads
-      # - DEFAULT_RESULTS_BUCKET=default-results
       
       # =================================================================
       # AWS S3 CONFIGURATION (Optional - for S3 result export)
@@ -78,26 +83,24 @@ services:
       - VAD_VALIDATION_ENABLED=false
       
       # =================================================================
-      # CORE WHISPERX CONFIGURATION
+      # WHISPERX PERFORMANCE SETTINGS
       # =================================================================
-      - WHISPERX_COMPUTE_TYPE=float32
+      # Batch size for processing (higher = faster but more memory)
       - WHISPERX_BATCH_SIZE=16
-      - WHISPERX_CHAR_ALIGN=false
+      
+      # Use WAV2VEC2 alignment (true) or Whisper built-in alignment (false)
       - USE_OPTIMIZED_ALIGNMENT=true
-      - WHISPERX_CHUNK_LENGTH=30
-      - VAD_ONSET=0.500
-      - VAD_OFFSET=0.200
+      
+      # Alignment Model Selection
+      # Options: WAV2VEC2_ASR_BASE_960H (~360MB) or WAV2VEC2_ASR_LARGE_LV60K_960H (~1.2GB)
       - ALIGN_MODEL=WAV2VEC2_ASR_LARGE_LV60K_960H
-      - INTERPOLATE_METHOD=linear
-      - SEGMENT_RESOLUTION=word
       
       # =================================================================
       # CONCURRENCY & PERFORMANCE
       # =================================================================
+      # Maximum concurrent GPU transcription requests
+      # Adjust based on GPU: RTX 3090=4, A100=8, H100=12-16
       - MAX_CONCURRENT_REQUESTS=12
-      - MEMORY_PER_REQUEST_GB=1.0
-      - ENABLE_REQUEST_QUEUING=true
-      - QUEUE_TIMEOUT=600
       
       # =================================================================
       # JOB PROCESSING & TIMEOUT CONFIGURATION

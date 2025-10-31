@@ -200,6 +200,7 @@ class WhisperXDiarizationServer:
         self.batch_size = int(os.getenv("WHISPERX_BATCH_SIZE", "16"))
         # Alignment optimization (enabled by default for best accuracy - WAV2VEC2 is slow but highest quality)
         self.use_optimized_alignment = os.getenv("USE_OPTIMIZED_ALIGNMENT", "true").lower() == "true"
+
         
         logger.info(f"🚀 WhisperX Diarization Server with Storage Integration")
         logger.info(f"Device: {self.device}")
@@ -239,10 +240,20 @@ class WhisperXDiarizationServer:
             
             # Load alignment model
             logger.info("Loading alignment model...")
-            self.alignment_model, self.align_model_metadata = whisperx.load_align_model(
-                language_code="en",
-                device=self.device
-            )
+            align_model_name = os.getenv("ALIGN_MODEL")
+            if align_model_name:
+                logger.info(f"Using custom alignment model: {align_model_name}")
+                self.alignment_model, self.align_model_metadata = whisperx.load_align_model(
+                    model_name=align_model_name,
+                    language_code="en",
+                    device=self.device
+                )
+            else:
+                logger.info("Using default alignment model for English")
+                self.alignment_model, self.align_model_metadata = whisperx.load_align_model(
+                    language_code="en",
+                    device=self.device
+                )
             
             # Load diarization pipeline
             logger.info("Loading diarization pipeline...")
