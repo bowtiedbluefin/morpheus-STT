@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  load-balancer:
+    image: kylecohen01/whisper-load-balancer:0.1
+    container_name: whisperx-load-balancer
+    ports:
+      - "8080:8080"
+    environment:
+      # Port configuration
+      - PORT=8080
+      
+      # Health check configuration
+      - HEALTH_CHECK_INTERVAL=30  # seconds
+      - REQUEST_TIMEOUT=3600      # seconds (1 hour)
+      
+      # Backend instance endpoints (configure up to 10)
+      # Add your Akash instance URLs here
+      - INSTANCE_1_URL=${INSTANCE_1_URL}
+      - INSTANCE_2_URL=${INSTANCE_2_URL}
+      - INSTANCE_3_URL=${INSTANCE_3_URL}
+      # - INSTANCE_4_URL=${INSTANCE_4_URL}
+      # - INSTANCE_5_URL=${INSTANCE_5_URL}
+      # - INSTANCE_6_URL=${INSTANCE_6_URL}
+      # - INSTANCE_7_URL=${INSTANCE_7_URL}
+      # - INSTANCE_8_URL=${INSTANCE_8_URL}
+      # - INSTANCE_9_URL=${INSTANCE_9_URL}
+      # - INSTANCE_10_URL=${INSTANCE_10_URL}
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/health', timeout=5.0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
