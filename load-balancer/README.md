@@ -4,12 +4,12 @@ A custom load balancer that routes transcription requests to the backend instanc
 
 ## Features
 
-- ✅ **Intelligent Routing**: Routes to instance with fewest `active_jobs`
-- ✅ **Health Monitoring**: Continuous health checks on all instances
-- ✅ **Automatic Failover**: Removes unhealthy instances from rotation
-- ✅ **Flexible Configuration**: Supports 1-10 instances via environment variables
-- ✅ **Pass-through Responses**: Returns exact backend responses to clients
-- ✅ **Production Ready**: Docker support, health checks, logging
+- **Intelligent Routing**: Routes to instance with fewest `active_jobs`
+- **Health Monitoring**: Continuous health checks on all instances
+- **Automatic Failover**: Removes unhealthy instances from rotation
+- **Flexible Configuration**: Supports 1-10 instances via environment variables
+- **Pass-through Responses**: Returns exact backend responses to clients
+- **Production Ready**: Docker support, health checks, logging
 
 ## How It Works
 

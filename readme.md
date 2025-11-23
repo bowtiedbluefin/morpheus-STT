@@ -19,15 +19,13 @@ WhisperX provides significant improvements over standard Whisper:
 - **Integrated Diarization**: Built-in speaker identification
 - **Faster Processing**: Optimized for speed and efficiency
 
-## 🎙️ Advanced Speaker Diarization
+## Advanced Speaker Diarization
 
 ### Features
-- **State-of-the-art Accuracy**: 95%+ speaker identification accuracy with 94.9% timeline consistency
-- **GPU Accelerated**: 10-50x faster processing with CUDA optimization and memory management
-- **Advanced Optimization**: 6-layer processing stack for maximum quality and reliability
-- **Enterprise Ready**: Comprehensive error handling, cuDNN conflict resolution, and production monitoring
-- **Configurable Parameters**: Fine-tune clustering, confidence, and validation thresholds for your use case
-- **Real-time Processing**: Optimized for production workloads with concurrent request handling
+- Speaker identification with confidence scoring
+- GPU acceleration for faster processing
+- Configurable parameters for clustering and validation
+- Production-ready with error handling and monitoring
 
 ### Quick Start with Diarization
 
@@ -79,20 +77,18 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
 }
 ```
 
-### Advanced Configuration
-
-The system includes sophisticated parameter tuning for optimal accuracy:
+### Configuration
 
 **Core Parameters:**
 - `PYANNOTE_CLUSTERING_THRESHOLD=0.7` - Controls speaker clustering (0.3-1.0)
-- `SPEAKER_CONFIDENCE_THRESHOLD=0.6` - Minimum confidence for attribution (0.0-1.0)  
+- `SPEAKER_CONFIDENCE_THRESHOLD=0.6` - Minimum confidence for attribution (0.0-1.0)
 - `MIN_SPEAKER_DURATION=3.0` - Minimum speaking time for valid speaker
 
-**Optimization Features:**
-- **Speaker Smoothing**: Reduces rapid A→B→A speaker switches
-- **Hierarchical Clustering**: Prevents over-detection with adaptive merging
-- **GPU Memory Management**: Prevents CUDA OOM with intelligent batch sizing
-- **cuDNN Compatibility**: Resolves version conflicts with proper library paths
+**Features:**
+- Speaker smoothing to reduce rapid speaker switches
+- Hierarchical clustering to prevent over-detection
+- GPU memory management
+- cuDNN compatibility handling
 
 See `env.example` for complete parameter documentation and tuning guidelines.
 

@@ -1,8 +1,19 @@
 # --- Builder Stage ---
 FROM python:3.12-slim AS builder
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y build-essential git
+# Install build dependencies (FFmpeg libs required for PyAV)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    pkg-config \
+    libavformat-dev \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavutil-dev \
+    libavfilter-dev \
+    libswscale-dev \
+    libswresample-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set up working directory
 WORKDIR /app

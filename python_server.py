@@ -38,9 +38,14 @@ import requests
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-# Load environment
 load_dotenv()
-load_dotenv("working_gpu.env")  # Load specific config for working GPU server
+load_dotenv("working_gpu.env")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Early CUDA initialization to catch GPU issues before server starts
 # This is critical for H100 and other high-end GPUs
@@ -53,15 +58,14 @@ if torch.cuda.is_available():
         torch.cuda.synchronize()
         del test_tensor
         torch.cuda.empty_cache()
-        print(f"✓ CUDA initialized successfully: {torch.cuda.get_device_name(0)}")
-        print(f"✓ CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"CUDA initialized successfully: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     except Exception as e:
-        print(f"⚠ WARNING: CUDA initialization failed: {e}")
-        print(f"⚠ Server will attempt to use CPU mode")
+        print(f"WARNING: CUDA initialization failed: {e}")
+        print(f"Server will attempt to use CPU mode")
 else:
-    print("ℹ CUDA not available - running in CPU mode")
+    print("CUDA not available - running in CPU mode")
 
-# Initialize R2/S3 clients
 r2_client = None
 s3_client = None
 
@@ -73,30 +77,14 @@ DEFAULT_RESULTS_BUCKET = os.getenv('DEFAULT_RESULTS_BUCKET', 'default-results')
 # This limits how many GPU transcriptions can run simultaneously
 MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', '4'))  # Default 4 for GPU concurrency
 
-# Upload timeout configuration (in seconds)
-UPLOAD_TIMEOUT_SECONDS = int(os.getenv('UPLOAD_TIMEOUT_SECONDS', '3600'))  # Default 1 hour
-
-# Job processing timeout configuration (in seconds)
-# Maximum time a job can run before being abandoned/cancelled
-# Default: 86400 seconds (24 hours)
-# Set to 0 to disable timeout (not recommended)
+UPLOAD_TIMEOUT_SECONDS = int(os.getenv('UPLOAD_TIMEOUT_SECONDS', '3600'))
 JOB_PROCESSING_TIMEOUT_SECONDS = int(os.getenv('JOB_PROCESSING_TIMEOUT_SECONDS', '86400'))
-
-# Job result retention configuration (in seconds)
-# How long to keep job results stored locally for retrieval via GET /v1/jobs/{job_id}
-# Default: 86400 seconds (24 hours)
-# Set to 0 to disable server-side result storage
 JOB_RESULT_RETENTION_SECONDS = int(os.getenv('JOB_RESULT_RETENTION_SECONDS', '86400'))
 
 # Local directory for storing job results
 JOB_RESULTS_DIR = os.getenv('JOB_RESULTS_DIR', '/tmp/whisper-job-results')
 
-# Thread pool for GPU work - limited to prevent GPU memory exhaustion
-# This allows multiple transcriptions to run concurrently on the GPU
 gpu_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix="gpu_worker")
-
-# Transcription tracking for load balancing visibility
-# Tracks all transcriptions: queued + running (not just async jobs)
 _active_transcriptions = 0
 _transcription_lock = asyncio.Lock()
 
@@ -130,12 +118,11 @@ async def tracked_transcription(transcription_func, *args, **kwargs):
 # Ensure job results directory exists
 if JOB_RESULT_RETENTION_SECONDS > 0:
     os.makedirs(JOB_RESULTS_DIR, exist_ok=True)
-    logger = logging.getLogger(__name__)  # Will be redefined later, but needed for startup
 
 def init_storage_clients():
     """Initialize R2 and S3 clients if credentials are provided"""
     global r2_client, s3_client
-    
+
     # Initialize R2 client
     if os.getenv('R2_ACCESS_KEY_ID') and os.getenv('R2_SECRET_ACCESS_KEY'):
         try:
@@ -146,19 +133,18 @@ def init_storage_clients():
                 aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
                 region_name='auto'
             )
-            logger.info("✅ R2 client initialized successfully")
+            logger.info("R2 client initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize R2 client: {e}")
             r2_client = None
     else:
         logger.info("R2 credentials not provided, R2 functionality disabled")
-    
-    # Initialize standard S3 client (only for result export, NOT needed for pre-signed URLs)
+
+    # Initialize S3 client for result export
     try:
-        # Only initialize if AWS credentials are available (for result export)
         if os.getenv('AWS_ACCESS_KEY_ID') or os.path.exists(os.path.expanduser('~/.aws/credentials')):
             s3_client = boto3.client('s3')
-            logger.info("✅ S3 client initialized successfully (for result export)")
+            logger.info("S3 client initialized successfully (for result export)")
         else:
             logger.info("AWS credentials not found - S3 result export disabled (pre-signed URLs still work)")
             s3_client = None
@@ -183,19 +169,10 @@ def convert_numpy_types(obj):
     else:
         return obj
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
 class WhisperXDiarizationServer:
-    """
-    Production WhisperX Diarization Server with Multi-Cloud Storage Support
-    """
+    """WhisperX Diarization Server with storage support"""
     
     def __init__(self):
-        # Initialize CUDA properly before checking availability (critical for H100)
         if torch.cuda.is_available():
             try:
                 # Force CUDA initialization and context creation
@@ -218,26 +195,22 @@ class WhisperXDiarizationServer:
         self.align_model_metadata = None
         self.diarization_pipeline = None
         
-        # Optimized Diarization Settings with Production-Ready Defaults
+        # Diarization settings
         self.clustering_threshold = float(os.getenv("PYANNOTE_CLUSTERING_THRESHOLD", "0.7"))
         self.segmentation_threshold = float(os.getenv("PYANNOTE_SEGMENTATION_THRESHOLD", "0.45"))
         self.min_speaker_duration = float(os.getenv("MIN_SPEAKER_DURATION", "3.0"))
         self.speaker_confidence_threshold = float(os.getenv("SPEAKER_CONFIDENCE_THRESHOLD", "0.6"))
-        # Advanced optimization settings
         self.speaker_smoothing_enabled = os.getenv("SPEAKER_SMOOTHING_ENABLED", "true").lower() == "true"
         self.min_switch_duration = float(os.getenv("MIN_SWITCH_DURATION", "2.0"))
-        # VAD validation (disabled by default - too aggressive)
         self.vad_validation_enabled = os.getenv("VAD_VALIDATION_ENABLED", "false").lower() == "true"
-        # WhisperX batch size optimization
         self.batch_size = int(os.getenv("WHISPERX_BATCH_SIZE", "16"))
-        # Alignment optimization (enabled by default for best accuracy - WAV2VEC2 is slow but highest quality)
         self.use_optimized_alignment = os.getenv("USE_OPTIMIZED_ALIGNMENT", "true").lower() == "true"
 
         
-        logger.info(f"🚀 WhisperX Diarization Server with Storage Integration")
+        logger.info(f"WhisperX Diarization Server with Storage Integration")
         logger.info(f"Device: {self.device}")
         logger.info(f"CUDA Available: {torch.cuda.is_available()}")
-        logger.info(f"📊 Diarization Parameters:")
+        logger.info(f"Diarization Parameters:")
         logger.info(f"   Clustering Threshold: {self.clustering_threshold}")
         logger.info(f"   Segmentation Threshold: {self.segmentation_threshold}")
         logger.info(f"   Min Speaker Duration: {self.min_speaker_duration}s")
@@ -264,7 +237,7 @@ class WhisperXDiarizationServer:
             # Load transcription model
             logger.info("Loading WhisperX transcription model...")
             self.transcription_model = whisperx.load_model(
-                "large-v3-turbo",  # Performance optimized model
+                "large-v3-turbo",
                 device=self.device,
                 compute_type=self.compute_type,
                 language="en"
@@ -295,7 +268,6 @@ class WhisperXDiarizationServer:
                 return
                 
             try:
-                # CORRECT API: Use pyannote.audio.Pipeline directly WITH GPU CONFIGURATION
                 from pyannote.audio import Pipeline
                 self.diarization_pipeline = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
@@ -305,15 +277,15 @@ class WhisperXDiarizationServer:
                 # Move diarization pipeline to GPU for better performance
                 if self.device == "cuda" and torch.cuda.is_available():
                     self.diarization_pipeline = self.diarization_pipeline.to(torch.device(self.device))
-                    logger.info(f"✅ Diarization pipeline moved to GPU: {self.device}")
-                    
-                    # GPU Memory optimization settings
-                    torch.backends.cudnn.benchmark = True
-                    torch.backends.cuda.matmul.allow_tf32 = True
-                    torch.backends.cudnn.allow_tf32 = True
-                    logger.info("✅ GPU acceleration optimizations enabled")
-                
-                logger.info("✅ Diarization pipeline loaded successfully")
+                logger.info(f"Diarization pipeline moved to GPU: {self.device}")
+
+                # GPU Memory optimization settings
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                logger.info("GPU acceleration optimizations enabled")
+
+                logger.info("Diarization pipeline loaded successfully")
             except ImportError as e:
                 logger.error(f"Failed to import pyannote.audio: {e}")
                 self.diarization_pipeline = None
@@ -321,7 +293,7 @@ class WhisperXDiarizationServer:
                 logger.error(f"Failed to load diarization pipeline: {e}")
                 self.diarization_pipeline = None
             
-            logger.info("✅ All models loaded successfully")
+            logger.info("All models loaded successfully")
             
         except Exception as e:
             logger.error(f"Error loading models: {e}")
@@ -329,12 +301,7 @@ class WhisperXDiarizationServer:
             raise
 
     def manual_speaker_assignment(self, transcription_result: dict, diarization_result, speaker_confidence_threshold: float = 0.6) -> dict:
-        """
-        Advanced speaker assignment with confidence scoring
-        
-        Uses manual assignment algorithm with speaker confidence threshold filtering
-        for improved accuracy and reliability.
-        """
+        """Assign speakers to transcription segments with confidence scoring"""
         try:
             # Convert diarization result to usable format with confidence tracking
             speaker_segments = []
@@ -348,10 +315,9 @@ class WhisperXDiarizationServer:
                     'speaker': speaker,
                     'segment_id': segment_id
                 })
-                # Default confidence - in real pyannote, this would come from the model
-                # For now, we simulate confidence based on segment length (longer = more confident)
+                # Calculate confidence based on segment duration
                 duration = segment.end - segment.start
-                confidence = min(0.95, 0.6 + (duration * 0.05))  # Simulate realistic confidence
+                confidence = min(0.95, 0.6 + (duration * 0.05))
                 segment_confidences[segment_id] = confidence
             
             # Assign speakers manually with confidence filtering
@@ -456,7 +422,7 @@ class WhisperXDiarizationServer:
                     confident_speakers.add(segment['speaker'])
             
             assignment_mode = "word-level" if any('words' in seg for seg in transcription_result['segments']) else "segment-level"
-            logger.info(f"✅ Speaker assignment complete ({assignment_mode}) - {len(confident_speakers)} confident speakers detected")
+            logger.info(f"Speaker assignment complete ({assignment_mode}) - {len(confident_speakers)} confident speakers detected")
             logger.info(f"   Total speakers found: {len(total_speakers)}, Confident speakers: {len(confident_speakers)}")
             logger.info(f"   Speaker confidence threshold: {speaker_confidence_threshold}")
             return transcription_result
@@ -467,10 +433,7 @@ class WhisperXDiarizationServer:
             return transcription_result
 
     def filter_spurious_speakers(self, result: dict, min_speaker_duration: float = 3.0, speaker_confidence_threshold: float = 0.6) -> dict:
-        """
-        Remove speakers with less than minimum speaking time using 
-        confidence-based filtering and multiple criteria
-        """
+        """Remove speakers with insufficient speaking time"""
         try:
             # Calculate total speaking time per speaker AND average confidence
             speaker_stats = {}
@@ -587,12 +550,13 @@ class WhisperXDiarizationServer:
                 if 'speaker' in segment and segment.get('speaker') not in spurious_speakers:
                     remaining_speakers.add(segment['speaker'])
             
-            logger.info(f"✅ Spurious speaker filtering complete - {len(remaining_speakers)} speakers remaining")
+            logger.info(f"Spurious speaker filtering complete - {len(remaining_speakers)} speakers remaining")
             return result
             
         except Exception as e:
             logger.error(f"Error filtering spurious speakers: {e}")
             logger.error(traceback.format_exc())
+            logger.warning("Continuing with unfiltered speaker data due to filtering error")
             return result
 
     def smooth_speaker_changes(self, result: dict, speaker_smoothing_enabled: bool = True, min_switch_duration: float = 2.0) -> dict:
@@ -654,12 +618,14 @@ class WhisperXDiarizationServer:
                             changes_made += 1
             
             if changes_made > 0:
-                logger.info(f"✅ Speaker smoothing complete - processed {changes_made} rapid switches")
+                logger.info(f"Speaker smoothing complete - processed {changes_made} rapid switches")
             
             return result
             
         except Exception as e:
             logger.error(f"Error in speaker smoothing: {e}")
+            logger.error(traceback.format_exc())
+            logger.warning("Continuing without speaker smoothing due to error")
             return result
 
     def validate_speakers_with_vad(self, result: dict, audio_path: str = None, cached_waveform_data=None) -> dict:
@@ -723,12 +689,14 @@ class WhisperXDiarizationServer:
                     logger.debug(f"Removing segment with low VAD: {voice_ratio:.3f}")
             
             result['segments'] = validated_segments
-            logger.info(f"✅ VAD validation complete - kept {len(validated_segments)}/{len(segments)} segments")
+            logger.info(f"VAD validation complete - kept {len(validated_segments)}/{len(segments)} segments")
             
             return result
             
         except Exception as e:
             logger.error(f"Error in VAD validation: {e}")
+            logger.error(traceback.format_exc())
+            logger.warning("Continuing without VAD validation due to error")
             # Return original result if VAD fails
             return result
 
@@ -855,12 +823,14 @@ class WhisperXDiarizationServer:
                 if 'speaker' in segment:
                     final_speakers.add(segment['speaker'])
             
-            logger.info(f"✅ Hierarchical clustering complete - {len(final_speakers)} final speakers (was {initial_speaker_count})")
+            logger.info(f"Hierarchical clustering complete - {len(final_speakers)} final speakers (was {initial_speaker_count})")
             
             return result
             
         except Exception as e:
             logger.error(f"Error in hierarchical clustering: {e}")
+            logger.error(traceback.format_exc())
+            logger.warning("Continuing without hierarchical clustering due to error")
             return result
 
     def preprocess_audio_for_diarization(self, audio_path: str) -> tuple[str, tuple]:
@@ -966,7 +936,7 @@ class WhisperXDiarizationServer:
                     pre_align_memory = torch.cuda.memory_allocated() / 1e6  # MB
                     logger.info(f"GPU memory before alignment: {pre_align_memory:.1f} MB")
                     logger.info(f"Alignment model device: {self.device}")
-                    logger.info(f"✅ GPU will be used for WAV2VEC2 alignment")
+                    logger.info(f"GPU will be used for WAV2VEC2 alignment")
                 
                 start_time = time.time()
                 result = whisperx.align(
@@ -1050,12 +1020,14 @@ class WhisperXDiarizationServer:
                         # Only clean up GPU memory once at the very end
                         torch.cuda.empty_cache()
                         logger.info(f"GPU memory after diarization: {final_memory:.1f} MB")
-                        logger.info(f"🚀 GPU-accelerated diarization completed in {diarize_time:.1f}s")
+                        logger.info(f"GPU-accelerated diarization completed in {diarize_time:.1f}s")
                     else:
                         logger.info(f"Diarization completed in {diarize_time:.1f}s")
                     
                 except Exception as e:
                     logger.error(f"Diarization failed but continuing: {e}")
+                    logger.error(traceback.format_exc())
+                    logger.warning("Transcription will continue without diarization data")
                     # Continue without diarization rather than crash
                 finally:
                     # Clean up temporary preprocessed audio file
@@ -1065,6 +1037,7 @@ class WhisperXDiarizationServer:
                             logger.debug(f"Cleaned up temporary audio file: {preprocessed_audio_path}")
                         except Exception as cleanup_error:
                             logger.warning(f"Failed to clean up temporary file {preprocessed_audio_path}: {cleanup_error}")
+                            logger.debug(traceback.format_exc())
             
             # Count speakers from segments
             total_speakers = 0
@@ -1269,11 +1242,13 @@ class WhisperXDiarizationServer:
             # Step 4: Hierarchical clustering refinement
             result = self.apply_hierarchical_clustering(result)
             
-            logger.info("✅ Optimized post-processing pipeline complete")
+            logger.info("Optimized post-processing pipeline complete")
             return result
             
         except Exception as e:
             logger.error(f"Error in optimized post-processing: {e}")
+            logger.error(traceback.format_exc())
+            logger.warning("Continuing with partially processed results due to post-processing error")
             return result
 
     def combined_speaker_filtering_and_smoothing(self, result: dict, min_speaker_duration: float, speaker_confidence_threshold: float, speaker_smoothing_enabled: bool, min_switch_duration: float) -> dict:
@@ -1389,15 +1364,17 @@ class WhisperXDiarizationServer:
                                 changes_made += 1
             
             if spurious_speakers:
-                logger.info(f"✅ Removed {len(spurious_speakers)} spurious speakers, reassigned {reassignments_made} segments")
-            
+                logger.info(f"Removed {len(spurious_speakers)} spurious speakers, reassigned {reassignments_made} segments")
+
             if changes_made > 0:
-                logger.info(f"✅ Applied speaker smoothing to {changes_made} segments")
+                logger.info(f"Applied speaker smoothing to {changes_made} segments")
             
             return result
             
         except Exception as e:
             logger.error(f"Error in combined filtering and smoothing: {e}")
+            logger.error(traceback.format_exc())
+            logger.warning("Continuing without speaker filtering/smoothing due to error")
             return result
 
     def identify_spurious_speakers(self, speaker_stats: dict, min_speaker_duration: float, speaker_confidence_threshold: float) -> list:
@@ -1493,9 +1470,9 @@ def save_job_result_local(job_id: str, result: dict) -> None:
     try:
         with open(result_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
-        logger.debug(f"💾 Saved job result locally: {result_path}")
+        logger.debug(f"Saved job result locally: {result_path}")
     except Exception as e:
-        logger.error(f"❌ Failed to save job result locally: {e}")
+        logger.error(f"Failed to save job result locally: {e}")
 
 def load_job_result_local(job_id: str) -> Optional[dict]:
     """Load job result from local filesystem"""
@@ -1510,7 +1487,7 @@ def load_job_result_local(job_id: str) -> Optional[dict]:
         with open(result_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception as e:
-        logger.error(f"❌ Failed to load job result from {result_path}: {e}")
+        logger.error(f"Failed to load job result from {result_path}: {e}")
         return None
 
 def cleanup_old_job_results() -> int:
@@ -1539,14 +1516,15 @@ def cleanup_old_job_results() -> int:
                 if current_time - file_mtime > JOB_RESULT_RETENTION_SECONDS:
                     os.unlink(file_path)
                     cleanup_count += 1
-                    logger.debug(f"🗑️ Cleaned up old job result: {filename}")
+                    logger.debug(f"Cleaned up old job result: {filename}")
             except Exception as e:
-                logger.warning(f"⚠️ Failed to cleanup {filename}: {e}")
-        
+                logger.warning(f"Failed to cleanup {filename}: {e}")
+
         if cleanup_count > 0:
-            logger.info(f"🗑️ Cleaned up {cleanup_count} old job result(s)")
+            logger.info(f"Cleaned up {cleanup_count} old job result(s)")
     except Exception as e:
-        logger.error(f"❌ Error during job result cleanup: {e}")
+        logger.error(f"Error during job result cleanup: {e}")
+        logger.error(traceback.format_exc())
     
     return cleanup_count
 
@@ -1596,7 +1574,7 @@ async def download_from_s3_presigned(presigned_url: str) -> str:
                         # Yield control to event loop periodically
                         await asyncio.sleep(0)
                     
-        logger.info(f"✅ Downloaded from pre-signed S3 URL -> {temp_file_path}")
+        logger.info(f"Downloaded from pre-signed S3 URL -> {temp_file_path}")
         return temp_file_path
         
     except httpx.HTTPStatusError as e:
@@ -1689,9 +1667,9 @@ async def upload_to_user_presigned_url(result: dict, presigned_url: str, max_ret
     
     # Log whether Content-Type was in signed headers
     if 'content-type' in signed_headers:
-        logger.info("✅ Content-Type was signed in URL - explicitly setting to application/json")
+        logger.info("Content-Type was signed in URL - explicitly setting to application/json")
     else:
-        logger.info("⚠️  Content-Type NOT signed in URL - adding anyway to prevent binary/octet-stream")
+        logger.info("Content-Type NOT signed in URL - adding anyway to prevent binary/octet-stream")
     
     # DO NOT add checksum headers - they are already in the URL query params if needed
     # Adding them as headers when they weren't signed will cause AccessDenied error
@@ -1719,38 +1697,38 @@ async def upload_to_user_presigned_url(result: dict, presigned_url: str, max_ret
                 )
                 
                 if response.status_code in [200, 201]:
-                    logger.info(f"✅ Successfully uploaded result to user-provided URL (attempt {attempt + 1})")
+                    logger.info(f"Successfully uploaded result to user-provided URL (attempt {attempt + 1})")
                     return presigned_url
                 elif response.status_code == 403:
                     response_text = response.text
                     # Check for specific AWS error conditions
                     if 'Request has expired' in response_text or 'expired' in response_text.lower():
                         # Presigned URL has expired - don't retry, this is a permanent error
-                        logger.error(f"❌ PRESIGNED URL EXPIRED: The presigned URL has expired. Job waited too long in queue or URL TTL was too short.")
+                        logger.error(f"PRESIGNED URL EXPIRED: The presigned URL has expired. Job waited too long in queue or URL TTL was too short.")
                         logger.error(f"   Response: {response_text[:500]}")
                         raise HTTPException(500, "Presigned URL expired - URL TTL must be longer than max queue wait time + processing time")
                     elif 'SignatureDoesNotMatch' in response_text:
                         # Signature error - could be transient or URL issue, worth retrying
-                        logger.warning(f"⚠️  SignatureDoesNotMatch error on attempt {attempt + 1}/{max_retries}")
+                        logger.warning(f"SignatureDoesNotMatch error on attempt {attempt + 1}/{max_retries}")
                         if attempt < max_retries - 1:
                             wait_time = 2 ** attempt
                             logger.info(f"Waiting {wait_time}s before retry...")
                             await asyncio.sleep(wait_time)
                             continue
                         else:
-                            logger.error(f"❌ SignatureDoesNotMatch persists after {max_retries} attempts: {response_text[:500]}")
+                            logger.error(f"SignatureDoesNotMatch persists after {max_retries} attempts: {response_text[:500]}")
                             raise HTTPException(500, f"AWS signature error after {max_retries} retries - check presigned URL generation")
                     else:
                         # Other 403 errors
-                        logger.error(f"❌ Access denied (403): {response_text[:500]}")
+                        logger.error(f"Access denied (403): {response_text[:500]}")
                         raise HTTPException(500, f"Access denied to presigned URL: {response_text[:200]}")
                 elif 400 <= response.status_code < 500:
                     # Other client errors (4xx) - don't retry, fail immediately
-                    logger.error(f"❌ Client error uploading to user URL (HTTP {response.status_code}): {response.text[:500]}")
+                    logger.error(f"Client error uploading to user URL (HTTP {response.status_code}): {response.text[:500]}")
                     raise HTTPException(500, f"Failed to upload to user URL: HTTP {response.status_code} - {response.text[:200]}")
                 else:
                     # Server error (5xx) - retry
-                    logger.warning(f"⚠️ Server error uploading to user URL (HTTP {response.status_code}), will retry: {response.text[:500]}")
+                    logger.warning(f"Server error uploading to user URL (HTTP {response.status_code}), will retry: {response.text[:500]}")
                     if attempt < max_retries - 1:
                         wait_time = 2 ** attempt
                         logger.info(f"Waiting {wait_time}s before retry...")
@@ -1761,43 +1739,43 @@ async def upload_to_user_presigned_url(result: dict, presigned_url: str, max_ret
                     
         except httpx.ConnectTimeout as e:
             last_exception = e
-            logger.warning(f"⚠️ Connect timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            logger.warning(f"Connect timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
                 logger.info(f"Waiting {wait_time}s before retry...")
                 await asyncio.sleep(wait_time)
             continue
-            
+
         except httpx.ReadTimeout as e:
             last_exception = e
-            logger.warning(f"⚠️ Read timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            logger.warning(f"Read timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 logger.info(f"Waiting {wait_time}s before retry...")
                 await asyncio.sleep(wait_time)
             continue
-            
+
         except httpx.WriteTimeout as e:
             last_exception = e
-            logger.warning(f"⚠️ Write timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            logger.warning(f"Write timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 logger.info(f"Waiting {wait_time}s before retry...")
                 await asyncio.sleep(wait_time)
             continue
-            
+
         except httpx.PoolTimeout as e:
             last_exception = e
-            logger.warning(f"⚠️ Pool timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            logger.warning(f"Pool timeout on attempt {attempt + 1}/{max_retries}: {str(e)}")
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 logger.info(f"Waiting {wait_time}s before retry...")
                 await asyncio.sleep(wait_time)
             continue
-            
+
         except httpx.RequestError as e:
             last_exception = e
-            logger.warning(f"⚠️ Network error on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            logger.warning(f"Network error on attempt {attempt + 1}/{max_retries}: {str(e)}")
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 logger.info(f"Waiting {wait_time}s before retry...")
@@ -1806,7 +1784,7 @@ async def upload_to_user_presigned_url(result: dict, presigned_url: str, max_ret
             
         except Exception as e:
             last_exception = e
-            logger.error(f"❌ Unexpected error uploading to user URL on attempt {attempt + 1}/{max_retries}: {str(e)}")
+            logger.error(f"Unexpected error uploading to user URL on attempt {attempt + 1}/{max_retries}: {str(e)}")
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 logger.info(f"Waiting {wait_time}s before retry...")
@@ -1815,7 +1793,7 @@ async def upload_to_user_presigned_url(result: dict, presigned_url: str, max_ret
     
     # All retries failed
     error_msg = f"Failed to upload after {max_retries} attempts. Last error: {type(last_exception).__name__} - {str(last_exception)}"
-    logger.error(f"❌ {error_msg}")
+    logger.error(f"{error_msg}")
     raise HTTPException(500, error_msg)
 
 async def _background_task_wrapper(coro):
@@ -1826,7 +1804,7 @@ async def _background_task_wrapper(coro):
     try:
         await coro
     except Exception as e:
-        logger.error(f"❌ CRITICAL: Background task failed with unhandled exception: {type(e).__name__} - {str(e)}")
+        logger.error(f"CRITICAL: Background task failed with unhandled exception: {type(e).__name__} - {str(e)}")
         logger.error(traceback.format_exc())
 
 async def process_transcription_background(
@@ -1884,10 +1862,12 @@ async def process_transcription_background(
             if JOB_PROCESSING_TIMEOUT_SECONDS > 0 and time.time() - start_time > JOB_PROCESSING_TIMEOUT_SECONDS:
                 raise TimeoutError(f"Job exceeded maximum processing time of {JOB_PROCESSING_TIMEOUT_SECONDS}s")
             
+            # Update job status (quick operation inside lock)
             async with job_lock:
                 active_jobs[job_id]["progress"] = "Downloading audio"
                 active_jobs[job_id]["status"] = "processing"
             
+            # Log outside of lock to avoid blocking
             if s3_presigned_url:
                 logger.info(f"📥 Downloading audio from pre-signed URL for job {job_id}...")
                 temp_audio_path = await download_from_s3_presigned(s3_presigned_url)
@@ -1901,11 +1881,13 @@ async def process_transcription_background(
         if JOB_PROCESSING_TIMEOUT_SECONDS > 0 and time.time() - start_time > JOB_PROCESSING_TIMEOUT_SECONDS:
             raise TimeoutError(f"Job exceeded maximum processing time of {JOB_PROCESSING_TIMEOUT_SECONDS}s")
         
+        # Update job status (quick operation inside lock)
         async with job_lock:
             active_jobs[job_id]["progress"] = "Transcribing audio"
             active_jobs[job_id]["status"] = "processing"
         
-        logger.info(f"🎙️ Transcribing audio for job {job_id}...")
+        # Log outside of lock
+        logger.info(f"Transcribing audio for job {job_id}...")
         # Run GPU transcription in thread pool to allow concurrent GPU processing
         # This offloads blocking GPU calls from event loop, enabling multiple jobs to process simultaneously
         # Uses tracked_transcription wrapper for load balancing visibility
@@ -1945,32 +1927,37 @@ async def process_transcription_background(
         if JOB_PROCESSING_TIMEOUT_SECONDS > 0 and time.time() - start_time > JOB_PROCESSING_TIMEOUT_SECONDS:
             raise TimeoutError(f"Job exceeded maximum processing time of {JOB_PROCESSING_TIMEOUT_SECONDS}s")
         
+        # Update job status and check if job still exists
+        job_exists = False
         async with job_lock:
             if job_id in active_jobs:
                 active_jobs[job_id]["progress"] = "Uploading results"
                 active_jobs[job_id]["status"] = "processing"
-            else:
-                logger.warning(f"⚠️ Job {job_id} was removed from active_jobs before upload phase")
+                job_exists = True
         
+        # Log outside of lock
+        if not job_exists:
+            logger.warning(f"Job {job_id} was removed from active_jobs before upload phase")
         logger.info(f"📤 Uploading results for job {job_id}...")
         
         # ALWAYS store result locally for retrieval via GET endpoint (if retention is enabled)
         if JOB_RESULT_RETENTION_SECONDS > 0:
             try:
                 save_job_result_local(job_id, result)
-                logger.info(f"✅ Stored result locally for GET retrieval")
+                logger.info(f"Stored result locally for GET retrieval")
             except Exception as storage_error:
-                logger.error(f"⚠️ Failed to store result locally (GET endpoint won't work): {storage_error}")
+                logger.error(f"Failed to store result locally (GET endpoint won't work): {storage_error}")
                 # Don't fail the job if local storage fails - continue with callback upload
-        
+
         # Upload to user's presigned URL if provided (optional callback)
         if upload_presigned_url:
             await upload_to_user_presigned_url(result, upload_presigned_url)
         else:
-            logger.info(f"✅ No callback URL provided, results stored locally only")
+            logger.info(f"No callback URL provided, results stored locally only")
         
         # Mark job as completed
         end_time = time.time()
+        job_exists = False
         async with job_lock:
             if job_id in active_jobs:
                 active_jobs[job_id]["status"] = "completed"
@@ -1980,14 +1967,18 @@ async def process_transcription_background(
                 if JOB_RESULT_RETENTION_SECONDS > 0:
                     active_jobs[job_id]["result_available"] = True
                     active_jobs[job_id]["result_expires_at"] = end_time + JOB_RESULT_RETENTION_SECONDS
-            else:
-                logger.warning(f"⚠️ Job {job_id} was removed from active_jobs before marking complete")
+                job_exists = True
         
-        logger.info(f"✅ Background job {job_id} completed successfully in {end_time - start_time:.2f}s")
+        # Log outside of lock
+        if not job_exists:
+            logger.warning(f"Job {job_id} was removed from active_jobs before marking complete")
+        logger.info(f"Background job {job_id} completed successfully in {end_time - start_time:.2f}s")
         
     except TimeoutError as e:
         end_time = time.time()
-        logger.error(f"⏱️ Background job {job_id} TIMEOUT after {end_time - start_time:.2f}s: {e}")
+        
+        # Log error outside of lock
+        logger.error(f"Background job {job_id} TIMEOUT after {end_time - start_time:.2f}s: {e}")
         
         # Create timeout error result
         error_result = {
@@ -2003,11 +1994,12 @@ async def process_transcription_background(
         if JOB_RESULT_RETENTION_SECONDS > 0:
             try:
                 save_job_result_local(job_id, error_result)
-                logger.info(f"✅ Stored timeout error result locally for GET retrieval")
+                logger.info(f"Stored timeout error result locally for GET retrieval")
             except Exception as storage_error:
-                logger.error(f"⚠️ Failed to store timeout error result locally: {storage_error}")
+                logger.error(f"Failed to store timeout error result locally: {storage_error}")
         
-        # Update job status to failed
+        # Update job status to failed (quick operation inside lock)
+        job_exists = False
         async with job_lock:
             if job_id in active_jobs:
                 active_jobs[job_id]["status"] = "failed"
@@ -2019,8 +2011,11 @@ async def process_transcription_background(
                 if JOB_RESULT_RETENTION_SECONDS > 0:
                     active_jobs[job_id]["result_available"] = True
                     active_jobs[job_id]["result_expires_at"] = end_time + JOB_RESULT_RETENTION_SECONDS
-            else:
-                logger.warning(f"⚠️ Job {job_id} was removed from active_jobs before marking timeout")
+                job_exists = True
+        
+        # Log warning outside of lock
+        if not job_exists:
+            logger.warning(f"Job {job_id} was removed from active_jobs before marking timeout")
         
         # Try to upload timeout error result to user's URL if provided
         if upload_presigned_url:
@@ -2028,11 +2023,13 @@ async def process_transcription_background(
                 await upload_to_user_presigned_url(error_result, upload_presigned_url)
                 logger.info(f"📤 Uploaded timeout error result for job {job_id}")
             except Exception as upload_error:
-                logger.error(f"❌ Failed to upload timeout error result for job {job_id}: {upload_error}")
+                logger.error(f"Failed to upload timeout error result for job {job_id}: {upload_error}")
     
     except Exception as e:
         end_time = time.time()
-        logger.error(f"❌ Background job {job_id} failed after {end_time - start_time:.2f}s: {e}")
+        
+        # Log error outside of lock
+        logger.error(f"Background job {job_id} failed after {end_time - start_time:.2f}s: {e}")
         logger.error(traceback.format_exc())
         
         # Create error result
@@ -2048,11 +2045,12 @@ async def process_transcription_background(
         if JOB_RESULT_RETENTION_SECONDS > 0:
             try:
                 save_job_result_local(job_id, error_result)
-                logger.info(f"✅ Stored error result locally for GET retrieval")
+                logger.info(f"Stored error result locally for GET retrieval")
             except Exception as storage_error:
-                logger.error(f"⚠️ Failed to store error result locally: {storage_error}")
+                logger.error(f"Failed to store error result locally: {storage_error}")
         
-        # Update job status to failed
+        # Update job status to failed (quick operation inside lock)
+        job_exists = False
         async with job_lock:
             if job_id in active_jobs:
                 active_jobs[job_id]["status"] = "failed"
@@ -2064,8 +2062,11 @@ async def process_transcription_background(
                 if JOB_RESULT_RETENTION_SECONDS > 0:
                     active_jobs[job_id]["result_available"] = True
                     active_jobs[job_id]["result_expires_at"] = end_time + JOB_RESULT_RETENTION_SECONDS
-            else:
-                logger.warning(f"⚠️ Job {job_id} was removed from active_jobs before marking failed")
+                job_exists = True
+        
+        # Log warning outside of lock
+        if not job_exists:
+            logger.warning(f"Job {job_id} was removed from active_jobs before marking failed")
         
         # Try to upload error result to user's URL if provided
         if upload_presigned_url:
@@ -2073,20 +2074,23 @@ async def process_transcription_background(
                 await upload_to_user_presigned_url(error_result, upload_presigned_url)
                 logger.info(f"📤 Uploaded error result for job {job_id}")
             except Exception as upload_error:
-                logger.error(f"❌ Failed to upload error result for job {job_id}: {upload_error}")
+                logger.error(f"Failed to upload error result for job {job_id}: {upload_error}")
     
     finally:
         # Cleanup temporary files
         if temp_audio_path and os.path.exists(temp_audio_path):
             try:
                 os.unlink(temp_audio_path)
-                logger.debug(f"🗑️ Cleaned up temporary audio file for job {job_id}: {temp_audio_path}")
+                logger.debug(f"Cleaned up temporary audio file for job {job_id}: {temp_audio_path}")
             except Exception as cleanup_error:
-                logger.warning(f"⚠️ Failed to cleanup temporary file {temp_audio_path}: {cleanup_error}")
+                logger.warning(f"Failed to cleanup temporary file {temp_audio_path}: {cleanup_error}")
+                logger.debug(traceback.format_exc())
         
         # Cleanup old job records and result files
         # CRITICAL: Don't remove jobs that are still processing or just completed
         try:
+            # Gather cleanup info inside lock
+            jobs_to_remove = []
             async with job_lock:
                 current_time = time.time()
                 # Use configured retention period for cleanup
@@ -2103,27 +2107,31 @@ async def process_transcription_background(
                 ]
                 for jid in jobs_to_remove:
                     del active_jobs[jid]
-                    logger.debug(f"🗑️ Removed old job record: {jid}")
-                
-                if jobs_to_remove:
-                    logger.info(f"🗑️ Cleaned up {len(jobs_to_remove)} old job records")
+            
+            # Log outside of lock
+            if jobs_to_remove:
+                logger.debug(f"Removed old job records: {', '.join(jobs_to_remove[:5])}" + 
+                           (f" and {len(jobs_to_remove)-5} more" if len(jobs_to_remove) > 5 else ""))
+                logger.info(f"Cleaned up {len(jobs_to_remove)} old job records")
             
             # Clean up old result files from filesystem
             cleanup_old_job_results()
         except Exception as cleanup_error:
-            logger.warning(f"⚠️ Failed to cleanup old job records: {cleanup_error}")
+            logger.warning(f"Failed to cleanup old job records: {cleanup_error}")
+            logger.debug(traceback.format_exc())
 
 async def periodic_cleanup_task():
     """Background task to periodically clean up old job results"""
     while True:
         try:
             await asyncio.sleep(3600)  # Run every hour
-            logger.info("🧹 Running periodic cleanup of old job results...")
+            logger.info("Running periodic cleanup of old job results...")
             cleanup_count = cleanup_old_job_results()
             if cleanup_count > 0:
-                logger.info(f"🧹 Periodic cleanup removed {cleanup_count} old result(s)")
+                logger.info(f"Periodic cleanup removed {cleanup_count} old result(s)")
         except Exception as e:
-            logger.error(f"❌ Error in periodic cleanup task: {e}")
+            logger.error(f"Error in periodic cleanup task: {e}")
+            logger.error(traceback.format_exc())
 
 @app.on_event("startup")
 async def startup_event():
@@ -2135,9 +2143,11 @@ async def startup_event():
         # Start periodic cleanup task
         if JOB_RESULT_RETENTION_SECONDS > 0:
             asyncio.create_task(periodic_cleanup_task())
-            logger.info(f"🧹 Started periodic cleanup task (retention: {JOB_RESULT_RETENTION_SECONDS}s)")
+            logger.info(f"Started periodic cleanup task (retention: {JOB_RESULT_RETENTION_SECONDS}s)")
     except Exception as e:
         logger.error(f"Failed to load models on startup: {e}")
+        logger.error(traceback.format_exc())
+        raise  # Re-raise to prevent server starting with broken models
 
 @app.get("/health")
 async def health_check():
@@ -2249,11 +2259,11 @@ async def get_job_status(job_id: str, include_result: bool = True):
                 # Merge the stored result with job metadata
                 # Keep job tracking data, but add the full transcription result
                 job_data["result"] = full_result
-                logger.debug(f"✅ Loaded full result for job {job_id}")
+                logger.debug(f"Loaded full result for job {job_id}")
             else:
                 job_data["result_note"] = "Result not available (may have been cleaned up or failed to store)"
         except Exception as e:
-            logger.error(f"❌ Error loading result for job {job_id}: {e}")
+            logger.error(f"Error loading result for job {job_id}: {e}")
             job_data["result_note"] = f"Error loading result: {str(e)}"
     
     return job_data
@@ -2465,79 +2475,34 @@ async def create_transcription(
     optimized_alignment: bool = Form(True, description="Use WAV2VEC2 alignment model (True) or Whisper built-in alignment (False) - True provides best accuracy")
 ):
     """
-    **Advanced Audio Transcription with Speaker Identification**
-    
-    Upload audio files and receive accurate transcriptions with speaker diarization,
-    supporting multiple input sources and automatic result export.
-    
-    **📁 File Input Options (choose ONE):**
-    - `file`: Direct file upload (optional - recommended for most use cases)
-    - `storage_key`: Reference to existing file in configured storage bucket  
-    - `s3_presigned_url`: Pre-signed URL for secure file access
-    
-    **Note**: Exactly one input source must be provided. The API will fail if none are provided or if multiple are provided.
-    
-    **📄 Transcription Output:**
-    - `response_format`: Choose output format (JSON, SRT, VTT, plain text)
-    - `output_content`: Control what's included in response:
-      - `text_only`: Returns only plain text transcription (no timestamps)
-      - `timestamps_only`: Returns JSON with timestamps and segments (no separate text field)
-      - `both`: Returns both plain text AND timestamped segments (default)
-      - `metadata_only`: Returns only processing metadata (no transcription text)
-    - `stored_output`: **Controls processing mode** (true = async with storage, false = sync with inline results)
-    - `upload_presigned_url`: Optional callback URL to upload results to your S3 bucket
-    - `output_key`: [Deprecated] No longer used (kept for backward compatibility)
-    
-    **⚡ Processing Modes:**
-    - **Async Mode** (when `stored_output=true`):
-      - Returns immediately with `job_id` and metadata
-      - Processes transcription in background
-      - Results stored locally on server for 24 hours (configurable)
-      - Retrieve results via `GET /v1/jobs/{job_id}`
-      - Optional: Also uploads to `upload_presigned_url` if provided
-    - **Sync Mode** (when `stored_output=false`):
-      - Waits for transcription to complete
-      - Returns full result inline in API response
-      - Respects `response_format` and `output_content` parameters
-      - No server-side storage
-    
-    **Retrieval Options:**
-    - **Polling** (async mode): Submit job, get `job_id`, poll `GET /v1/jobs/{job_id}` for results
-    - **Callback** (async mode with `upload_presigned_url`): Results uploaded to your S3, also retrievable via GET endpoint
-    - **Inline** (sync mode): Immediate response with full transcription results
-    
-    **⚙️ Transcription Settings:**
-    - Multi-language support with automatic detection
-    - Advanced speaker diarization with confidence scoring
-    - Flexible timestamp granularity (segment, word, or both)
-    - Context prompts for improved accuracy with technical terms
-    
-    **🎛️ Fine-Tuning Settings:**
-    - Speaker recognition parameters for optimal accuracy
-    - GPU batch processing optimization
-    - Voice activity detection controls
-    - Speaker transition smoothing options
-    
-    **🚀 Performance Features:**
-    - GPU-accelerated processing pipeline
-    - Automatic result archiving to cloud storage
-    - Enterprise-grade reliability and cleanup
-    - Memory-efficient processing for large files
+    Advanced audio transcription API with speaker diarization.
+
+    Transcribes audio files and identifies speakers with confidence scoring.
+    Supports multiple input sources and processing modes.
+
+    **Processing Modes:**
+    - **Sync Mode** (stored_output=false): Immediate response with transcription results
+    - **Async Mode** (stored_output=true): Background processing with job tracking
+
+    **Output Content Control (output_content parameter):**
+    - `text_only`: Plain text transcription only (no timestamps)
+    - `timestamps_only`: JSON with timing data only (no text)
+    - `both`: Combined text and timestamp data (default)
+    - `metadata_only`: Processing metadata only (no transcription)
+
+    **Input Sources:** Direct file upload, storage keys, or pre-signed S3 URLs.
+    **Output Formats:** JSON, text, SRT, VTT with configurable content options.
     """
     temp_audio_path = None
     try:
-        # DEBUG: Track timing
         import time
         start_time = time.time()
-        logger.info(f"🚀 Request started at {start_time}")
+        logger.info(f"Request started at {start_time}")
 
-        # Check for async mode FIRST before any processing
-        # Async mode is triggered by stored_output=true (results stored locally for later retrieval)
-        # This allows immediate response instead of waiting for downloads or form processing
+        # Check for async mode first before any processing
         is_async_mode = stored_output
 
-        # Handle legacy parameters if provided (model, temperature) - these are ignored but logged
-        # Only process form data if NOT in async mode to avoid blocking the response
+        # Handle legacy parameters if provided
         ignored_params = []
         if not is_async_mode:
             form_data = await request.form()
@@ -2559,7 +2524,7 @@ async def create_transcription(
                     ignored_params.append(f"temperature={temperature_value} (invalid, using 0.0)")
 
         if ignored_params:
-            logger.info(f"ℹ️  Ignored parameters in this request: {', '.join(ignored_params)}")
+            logger.info(f"Ignored parameters in this request: {', '.join(ignored_params)}")
 
         # Validate input parameters
         file_provided = file is not None and file.filename is not None and file.filename.strip() != ""
@@ -2576,48 +2541,34 @@ async def create_transcription(
 
         # Handle different input sources
         if file:
-            # Direct file upload - use async file I/O to avoid blocking event loop
             temp_audio_path = tempfile.mktemp(suffix=".wav")
-            
-            # Read file content asynchronously to avoid blocking
             content = await file.read()
-            
-            # Write to temp file in thread pool to avoid blocking event loop
             await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: Path(temp_audio_path).write_bytes(content)
             )
 
         elif storage_key:
-            # Storage object download from configured bucket
             if is_async_mode:
-                # ASYNC MODE: Don't download yet, let background task do it
                 logger.info(f"Async mode: Will download from storage in background")
                 temp_audio_path = None  # Background task will download
             else:
-                # SYNC MODE: Download now
                 bucket = DEFAULT_UPLOAD_BUCKET
                 logger.info(f"Processing storage object: {bucket}/{storage_key}")
                 temp_audio_path = await download_from_r2(bucket, storage_key)
 
         elif s3_presigned_url:
-            # Pre-signed S3 URL - download NOW for sync mode, or LATER in background for async mode
             if is_async_mode:
-                # ASYNC MODE: Don't download yet, let background task do it
                 logger.info(f"Async mode: Will download from pre-signed URL in background")
                 temp_audio_path = None  # Background task will download
             else:
-                # SYNC MODE: Download now
                 temp_audio_path = await download_from_s3_presigned(s3_presigned_url)
 
-        # ASYNC PROCESSING MODE: If stored_output=true, return immediately with job_id
-        # Results will be stored locally and retrievable via GET /v1/jobs/{job_id}
         if stored_output:
             # Generate unique job ID
             job_id = str(uuid.uuid4())
 
-            logger.info(f"🚀 Starting async transcription job {job_id}")
-            logger.info(f"   Results will be stored locally for retrieval")
+            logger.info(f"Starting async transcription job {job_id}")
             if upload_presigned_url:
                 logger.info(f"   Will also upload results to user-provided presigned URL")
 
@@ -2827,17 +2778,17 @@ async def create_transcription(
                 logger.warning(f"Failed to cleanup temporary file {temp_audio_path}: {cleanup_error}")
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting WhisperX Diarization Server with Multi-Cloud Storage")
-    logger.info("✅ FEATURES ENABLED:")
-    logger.info("   - Advanced speaker diarization with confidence scoring")
+    logger.info("Starting WhisperX Diarization Server with Multi-Cloud Storage")
+    logger.info("FEATURES ENABLED:")
+    logger.info("   - Speaker diarization with confidence scoring")
     logger.info("   - Multi-cloud storage support (R2, S3)")
     logger.info("   - GPU-accelerated processing")
     logger.info("   - Automatic result export")
-    logger.info("🚀 STORAGE INTEGRATIONS:")
+    logger.info("STORAGE INTEGRATIONS:")
     logger.info("   - Cloudflare R2 direct upload and processing")
     logger.info("   - Pre-signed S3 URL support")
     logger.info("   - Automatic result archiving")
-    logger.info("   - Zero-bandwidth cost processing for large files")
+    logger.info("   - Efficient processing for large files")
     
     uvicorn.run(
         app,

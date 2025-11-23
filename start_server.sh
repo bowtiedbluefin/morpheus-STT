@@ -4,7 +4,7 @@
 # Includes cuDNN compatibility and GPU memory management
 # CRITICAL FIX: Prioritizes system cuDNN over venv cuDNN to prevent sublibrary mismatch
 
-echo "🚀 Starting WhisperX Diarization Server with GPU optimization..."
+echo "Starting WhisperX Diarization Server with GPU optimization..."
 
 # Activate virtual environment
 if [ -d "venv" ]; then

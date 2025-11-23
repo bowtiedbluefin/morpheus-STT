@@ -8,7 +8,7 @@ echo "=== WhisperX Server GPU Initialization ==="
 
 # Check if GPU is available
 if command -v nvidia-smi &> /dev/null; then
-    echo "✓ nvidia-smi found"
+    echo "nvidia-smi found"
     
     # Display GPU information
     echo ""
@@ -20,9 +20,9 @@ if command -v nvidia-smi &> /dev/null; then
     echo "Checking for GPU processes..."
     GPU_PROCESSES=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null || echo "")
     if [ -z "$GPU_PROCESSES" ]; then
-        echo "✓ No GPU processes detected - GPU is available"
+        echo "No GPU processes detected - GPU is available"
     else
-        echo "⚠ WARNING: GPU processes detected:"
+        echo "WARNING: GPU processes detected:"
         echo "$GPU_PROCESSES"
         echo "Attempting to clear GPU state..."
         
@@ -36,7 +36,7 @@ if command -v nvidia-smi &> /dev/null; then
     sleep 2
     
 else
-    echo "⚠ WARNING: nvidia-smi not found - running without GPU"
+    echo "WARNING: nvidia-smi not found - running without GPU"
 fi
 
 # Display CUDA environment variables
