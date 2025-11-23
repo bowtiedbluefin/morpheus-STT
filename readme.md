@@ -191,12 +191,12 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "enable_diarization=true" \
   -F "response_format=json"
 
-# Diarization with speaker constraints
+# Diarization with fine-tuned parameters
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@audio.wav" \
   -F "enable_diarization=true" \
-  -F "min_speakers=2" \
-  -F "max_speakers=4" \
+  -F "clustering_threshold=0.7" \
+  -F "min_speaker_duration=3.0" \
   -F "response_format=json"
 
 # SRT format with speaker labels
@@ -217,11 +217,10 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
 
 ##### Advanced Features Examples
 ```bash
-# Multiple timestamp granularities
+# Multiple timestamp granularities (comma-separated)
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@audio.wav" \
-  -F "timestamp_granularities=word" \
-  -F "timestamp_granularities=segment" \
+  -F "timestamp_granularities=segment,word" \
   -F "response_format=json"
 
 # Language-specific with diarization
@@ -266,13 +265,17 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@/path/to/your/audio/file.wav" \
   -F "language=en" \
   -F "response_format=verbose_json" \
-  -F "timestamp_granularities[]=word" \
+  -F "timestamp_granularities=word" \
   -F "output_content=both" \
   -F "enable_diarization=true" \
   -F "optimized_alignment=true" \
   -F "batch_size=16" \
-  -F "min_speakers=2" \
-  -F "max_speakers=5" \
+  -F "clustering_threshold=0.7" \
+  -F "segmentation_threshold=0.45" \
+  -F "min_speaker_duration=3.0" \
+  -F "speaker_confidence_threshold=0.6" \
+  -F "speaker_smoothing_enabled=true" \
+  -F "min_switch_duration=2.0" \
   -o transcription_with_words.json
 ```
 
@@ -282,19 +285,19 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@audio.wav" \
   -F "response_format=json" \
-  -F "timestamp_granularities[]=segment"
+  -F "timestamp_granularities=segment"
 
 # JSON with word-level timestamps
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@audio.wav" \
   -F "response_format=json" \
-  -F "timestamp_granularities[]=word"
+  -F "timestamp_granularities=word"
 
 # Verbose JSON with metadata (OpenAI format)
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@audio.wav" \
   -F "response_format=verbose_json" \
-  -F "timestamp_granularities[]=word"
+  -F "timestamp_granularities=word"
 
 # Plain text output
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
@@ -324,14 +327,14 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@audio.wav" \
   -F "response_format=json" \
-  -F "timestamp_granularities[]=segment" \
+  -F "timestamp_granularities=segment" \
   -F "output_content=timestamps_only"
 
 # Both text and timestamps (default)
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@audio.wav" \
   -F "response_format=json" \
-  -F "timestamp_granularities[]=word" \
+  -F "timestamp_granularities=word" \
   -F "output_content=both"
 ```
 
@@ -361,13 +364,13 @@ files = {"file": open("audio.wav", "rb")}
 data = {
     "language": "en",
     "response_format": "verbose_json",
-    "timestamp_granularities[]": "word",
+    "timestamp_granularities": "word",
     # WhisperX features
     "enable_diarization": True,
     "optimized_alignment": True,  # True=accurate, False=fast
     "batch_size": 16,
-    "min_speakers": 2,
-    "max_speakers": 4,
+    "clustering_threshold": 0.7,
+    "min_speaker_duration": 3.0,
     "output_content": "both"
 }
 response = requests.post(url, files=files, data=data)
@@ -386,13 +389,13 @@ const form = new FormData();
 form.append('file', fs.createReadStream('audio.wav'));
 form.append('language', 'en');
 form.append('response_format', 'verbose_json');
-form.append('timestamp_granularities[]', 'segment');
+form.append('timestamp_granularities', 'segment');
 // WhisperX features
 form.append('enable_diarization', 'true');
 form.append('optimized_alignment', 'true'); // true=accurate, false=fast
 form.append('batch_size', '16');
-form.append('min_speakers', '2');
-form.append('max_speakers', '4');
+form.append('clustering_threshold', '0.7');
+form.append('min_speaker_duration', '3.0');
 form.append('output_content', 'both');
 
 axios.post('http://localhost:3333/v1/audio/transcriptions', form, {
@@ -433,21 +436,28 @@ with open("audio.wav", "rb") as audio_file:
 ### Core Parameters
 - **`language`**: Language code (ISO-639-1) like "en", "es", "fr" - improves accuracy and speed
 - **`response_format`**: Output format - `json`, `text`, `srt`, `vtt`, `verbose_json`
-- **`timestamp_granularities[]`**: Array or single value - `segment`, `word`
+- **`timestamp_granularities`**: String value (comma-separated for multiple) - `segment`, `word`, `segment,word`
 
 ### WhisperX Enhanced Parameters
 - **`output_content`**: Control response content: `text_only`, `timestamps_only`, or `both` (default: 'both')
-- **`enable_diarization`**: Enable speaker diarization to identify who is speaking (default: False)
-- **`min_speakers`**: Minimum number of speakers to detect for diarization (optional)
-- **`max_speakers`**: Maximum number of speakers to detect for diarization (optional)
+- **`enable_diarization`**: Enable speaker diarization to identify who is speaking (default: **True**)
+- **`prompt`**: Optional text prompt to provide context or guide the transcription (e.g., proper names, technical terms)
 - **`optimized_alignment`**: Use WAV2VEC2 alignment model (True) or Whisper built-in alignment (False). True provides better speaker diarization accuracy but takes ~2x longer. False is ~50% faster but may have slightly less accurate speaker attribution. (default: True)
 
+### Fine-Tuning Parameters
+- **`batch_size`**: Batch size for processing (higher = faster but more memory, default: 16)
+- **`clustering_threshold`**: Speaker clustering threshold (0.5-1.0, lower = more speakers, default: 0.7)
+- **`segmentation_threshold`**: Voice activity detection threshold (0.1-0.9, default: 0.45)
+- **`min_speaker_duration`**: Minimum speaking time per speaker in seconds (default: 3.0)
+- **`speaker_confidence_threshold`**: Minimum confidence for speaker assignment (0.1-1.0, default: 0.6)
+- **`speaker_smoothing_enabled`**: Enable speaker transition smoothing (default: True)
+- **`min_switch_duration`**: Minimum time between speaker switches in seconds (default: 2.0)
+- **`vad_validation_enabled`**: Enable Voice Activity Detection validation - experimental (default: False)
 
-### Legacy Parameters (Present but not used by WhisperX)
-- **`model`**: Model identifier (ignored - always uses WhisperX large-v3-turbo) - for OpenAI compatibility
-- **`prompt`**: Initial prompt (accepted for compatibility but not used)
+
+### Legacy Parameters (Accepted for OpenAI compatibility but not used)
+- **`model`**: Model identifier (ignored - always uses WhisperX large-v3-turbo)
 - **`temperature`**: Sampling temperature (accepted for compatibility but not used)
-- **`enable_profanity_filter`**: Profanity filter (accepted for compatibility but not implemented)
 
 ### Response Formats
 

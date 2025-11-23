@@ -1,0 +1,93 @@
+---
+version: "2.0"
+
+# WhisperX Load Balancer - Akash Deployment
+# =========================================================
+# CPU-based load balancer for distributing requests across
+# multiple GPU Whisper instances. Configure your custom
+# domain in the 'accept' field below.
+
+services:
+  load-balancer:
+    image: kylecohen01/whisper-load-balancer:0.2
+    expose:
+      - port: 8080
+        as: 80
+        to:
+          - global: true
+        proto: tcp
+        accept:
+          # Configure your custom domain(s) here
+          # After deployment, add CNAME records pointing to the Akash provider hostname
+          - lb.yourdomain.com
+          # - lb.example.com  # Add additional domains as needed
+        http_options:
+          max_body_size: 4294967295  # 4GB max (same as Whisper instances)
+          read_timeout: 3600000      # 1 hour
+          send_timeout: 600000       # 10 minutes
+          next_cases:
+            - error
+            - timeout
+          next_tries: 3
+          next_timeout: 600000
+    env:
+      # =================================================================
+      # PORT CONFIGURATION
+      # =================================================================
+      - PORT=8080
+      
+      # =================================================================
+      # HEALTH CHECK & TIMEOUT CONFIGURATION
+      # =================================================================
+      - HEALTH_CHECK_INTERVAL=30   # Check backends every 30 seconds
+      - REQUEST_TIMEOUT=3600       # 1 hour timeout for large files
+      
+      # =================================================================
+      # BACKEND WHISPER INSTANCES
+      # =================================================================
+      # Configure your Whisper instance custom domains here
+      # These should point to your deployed Whisper GPU instances
+      # 
+      # IMPORTANT: Use your custom domains (e.g., w1.yourdomain.com)
+      # Set up CNAME records for these domains pointing to Akash provider URLs
+      # 
+      - INSTANCE_1_URL=https://w1.yourdomain.com
+      - INSTANCE_2_URL=https://w2.yourdomain.com
+      - INSTANCE_3_URL=https://w3.yourdomain.com
+      # - INSTANCE_4_URL=https://w4.yourdomain.com
+      # - INSTANCE_5_URL=https://w5.yourdomain.com
+      # - INSTANCE_6_URL=https://w6.yourdomain.com
+      # - INSTANCE_7_URL=https://w7.yourdomain.com
+      # - INSTANCE_8_URL=https://w8.yourdomain.com
+      # - INSTANCE_9_URL=https://w9.yourdomain.com
+      # - INSTANCE_10_URL=https://w10.yourdomain.com
+
+profiles:
+  compute:
+    load-balancer:
+      resources:
+        cpu:
+          units: 2.0
+        memory:
+          size: 4Gi
+        storage:
+          - size: 1Gi
+  placement:
+    dcloud:
+      attributes:
+        host: akash
+      signedBy:
+        anyOf:
+          - "akash1365yvmc4s7awdyj3n2sav7xfx76adc6dnmlx63"
+      pricing:
+        load-balancer: 
+          denom: uakt
+          amount: 1000
+
+deployment:
+  load-balancer:
+    dcloud:
+      profile: load-balancer
+      count: 1
+
+

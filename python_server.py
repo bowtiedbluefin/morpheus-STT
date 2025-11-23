@@ -95,6 +95,38 @@ JOB_RESULTS_DIR = os.getenv('JOB_RESULTS_DIR', '/tmp/whisper-job-results')
 # This allows multiple transcriptions to run concurrently on the GPU
 gpu_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix="gpu_worker")
 
+# Transcription tracking for load balancing visibility
+# Tracks all transcriptions: queued + running (not just async jobs)
+_active_transcriptions = 0
+_transcription_lock = asyncio.Lock()
+
+async def get_active_transcription_count() -> int:
+    """Get the current number of active transcriptions (queued + running)"""
+    async with _transcription_lock:
+        return _active_transcriptions
+
+async def tracked_transcription(transcription_func, *args, **kwargs):
+    """
+    Wrapper to track all transcriptions for load balancing visibility.
+    Increments counter when queued, decrements when completed.
+    This gives load balancers accurate view of total load (queued + running).
+    """
+    global _active_transcriptions
+    
+    async with _transcription_lock:
+        _active_transcriptions += 1
+    
+    try:
+        # Run GPU transcription in thread pool
+        result = await asyncio.get_event_loop().run_in_executor(
+            gpu_executor,
+            lambda: transcription_func(*args, **kwargs)
+        )
+        return result
+    finally:
+        async with _transcription_lock:
+            _active_transcriptions -= 1
+
 # Ensure job results directory exists
 if JOB_RESULT_RETENTION_SECONDS > 0:
     os.makedirs(JOB_RESULTS_DIR, exist_ok=True)
@@ -1062,8 +1094,10 @@ class WhisperXDiarizationServer:
             logger.info(f"Applying timestamp granularities filter: {granularities}")
             
             if 'segment' in granularities and 'word' in granularities:
-                # Both segment and word level - keep everything
+                # Both segment and word level - keep everything except word_segments artifact
                 filtered_result = result.copy()
+                # Remove word_segments to avoid duplicate word data (keep words in segments and/or root-level words)
+                filtered_result.pop('word_segments', None)
                 logger.info("Keeping both segment and word level timestamps")
             elif 'segment' in granularities and 'word' not in granularities:
                 # Only segment level - remove ALL word-level data
@@ -1102,6 +1136,8 @@ class WhisperXDiarizationServer:
                 
                 # Completely remove segments structure
                 filtered_result.pop('segments', None)
+                # Also remove word_segments if it exists (WhisperX artifact to avoid duplicates)
+                filtered_result.pop('word_segments', None)
                 
                 # Keep only word-level data at root level
                 logger.info(f"Word-only result structure: root_words={'words' in filtered_result}, total_words={len(filtered_result.get('words', []))}, segments_removed=True")
@@ -1112,6 +1148,7 @@ class WhisperXDiarizationServer:
                 logger.info("Using default granularity (segment-only)")
                 # Default to segment-only behavior
                 filtered_result.pop('words', None)
+                filtered_result.pop('word_segments', None)  # Also remove word_segments artifact
                 if 'segments' in filtered_result:
                     for segment in filtered_result['segments']:
                         segment.pop('words', None)
@@ -1871,31 +1908,30 @@ async def process_transcription_background(
         logger.info(f"🎙️ Transcribing audio for job {job_id}...")
         # Run GPU transcription in thread pool to allow concurrent GPU processing
         # This offloads blocking GPU calls from event loop, enabling multiple jobs to process simultaneously
+        # Uses tracked_transcription wrapper for load balancing visibility
         # 
         # IMPORTANT: output_content parameter controls what gets uploaded to AWS
         # The inline API response is ALWAYS metadata-only for async mode (handled at endpoint level)
         # But the AWS upload respects user's output_content choice
-        result = await asyncio.get_event_loop().run_in_executor(
-            gpu_executor,
-            lambda: server.transcribe_with_diarization(
-                temp_audio_path, 
-                enable_diarization=enable_diarization,
-                language=language,
-                model="large-v3-turbo",
-                batch_size=batch_size,
-                prompt=prompt,
-                temperature=0.0,
-                timestamp_granularities=timestamp_granularities,
-                output_content=output_content,  # User's choice - controls AWS upload content
-                clustering_threshold=clustering_threshold,
-                segmentation_threshold=segmentation_threshold,
-                min_speaker_duration=min_speaker_duration,
-                speaker_confidence_threshold=speaker_confidence_threshold,
-                speaker_smoothing_enabled=speaker_smoothing_enabled,
-                min_switch_duration=min_switch_duration,
-                vad_validation_enabled=vad_validation_enabled,
-                optimized_alignment=optimized_alignment
-            )
+        result = await tracked_transcription(
+            server.transcribe_with_diarization,
+            temp_audio_path, 
+            enable_diarization=enable_diarization,
+            language=language,
+            model="large-v3-turbo",
+            batch_size=batch_size,
+            prompt=prompt,
+            temperature=0.0,
+            timestamp_granularities=timestamp_granularities,
+            output_content=output_content,  # User's choice - controls AWS upload content
+            clustering_threshold=clustering_threshold,
+            segmentation_threshold=segmentation_threshold,
+            min_speaker_duration=min_speaker_duration,
+            speaker_confidence_threshold=speaker_confidence_threshold,
+            speaker_smoothing_enabled=speaker_smoothing_enabled,
+            min_switch_duration=min_switch_duration,
+            vad_validation_enabled=vad_validation_enabled,
+            optimized_alignment=optimized_alignment
         )
         
         # Add job ID and timing to result
@@ -2108,12 +2144,15 @@ async def health_check():
     """
     Health check endpoint with system status and concurrency metrics
     """
-    # Count jobs by status
+    # Count jobs by status (async jobs only)
     async with job_lock:
         total_jobs = len(active_jobs)
         processing_jobs = sum(1 for job in active_jobs.values() if job.get("status") == "processing")
         completed_jobs = sum(1 for job in active_jobs.values() if job.get("status") == "completed")
         failed_jobs = sum(1 for job in active_jobs.values() if job.get("status") == "failed")
+    
+    # Get active transcription count (ALL transcriptions: sync + async, queued + running)
+    active_transcription_count = await get_active_transcription_count()
     
     return {
         "status": "healthy",
@@ -2121,11 +2160,12 @@ async def health_check():
         "device": server.device,
         "concurrency": {
             "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+            "active_transcriptions": active_transcription_count,
             "active_jobs": total_jobs,
             "processing": processing_jobs,
             "completed": completed_jobs,
             "failed": failed_jobs,
-            "note": "Concurrency is handled by Python's async event loop - no artificial limits"
+            "note": "active_transcriptions = ALL transcriptions (queued + running). active_jobs = async jobs only (created with stored_output=true)"
         },
         "timeouts": {
             "upload_timeout_seconds": UPLOAD_TIMEOUT_SECONDS,
@@ -2644,27 +2684,26 @@ async def create_transcription(
         
         # SYNCHRONOUS PROCESSING MODE: Process transcription and wait for completion
         # Run GPU transcription in thread pool to allow concurrent GPU processing
-        result = await asyncio.get_event_loop().run_in_executor(
-            gpu_executor,
-            lambda: server.transcribe_with_diarization(
-                temp_audio_path, 
-                enable_diarization=enable_diarization,
-                language=language,
-                model="large-v3-turbo",  # Performance optimized model
-                batch_size=batch_size,
-                prompt=prompt,
-                temperature=0.0,  # Always use 0.0 (ignored parameters handled above)
-                timestamp_granularities=timestamp_granularities,
-                output_content=output_content,
-                clustering_threshold=clustering_threshold,
-                segmentation_threshold=segmentation_threshold,
-                min_speaker_duration=min_speaker_duration,
-                speaker_confidence_threshold=speaker_confidence_threshold,
-                speaker_smoothing_enabled=speaker_smoothing_enabled,
-                min_switch_duration=min_switch_duration,
-                vad_validation_enabled=vad_validation_enabled,
-                optimized_alignment=optimized_alignment
-            )
+        # Uses tracked_transcription wrapper for load balancing visibility
+        result = await tracked_transcription(
+            server.transcribe_with_diarization,
+            temp_audio_path, 
+            enable_diarization=enable_diarization,
+            language=language,
+            model="large-v3-turbo",  # Performance optimized model
+            batch_size=batch_size,
+            prompt=prompt,
+            temperature=0.0,  # Always use 0.0 (ignored parameters handled above)
+            timestamp_granularities=timestamp_granularities,
+            output_content=output_content,
+            clustering_threshold=clustering_threshold,
+            segmentation_threshold=segmentation_threshold,
+            min_speaker_duration=min_speaker_duration,
+            speaker_confidence_threshold=speaker_confidence_threshold,
+            speaker_smoothing_enabled=speaker_smoothing_enabled,
+            min_switch_duration=min_switch_duration,
+            vad_validation_enabled=vad_validation_enabled,
+            optimized_alignment=optimized_alignment
         )
         
         # SYNCHRONOUS MODE: Return results inline based on response_format and output_content
@@ -2677,31 +2716,98 @@ async def create_transcription(
             return result  # Return as proper JSON response
         elif response_format == "text":
             # Extract just the text content
-            text_content = "\n".join([segment.get('text', '') for segment in result.get('result', {}).get('segments', [])])
+            segments = result.get('result', {}).get('segments', [])
+            if segments:
+                # Use segments if available
+                text_content = "\n".join([segment.get('text', '') for segment in segments])
+            elif 'result' in result and 'words' in result['result']:
+                # Use words if segments not available (word-level timestamp request)
+                words = result['result']['words']
+                text_content = ' '.join([word.get('word', word.get('text', '')) for word in words])
+            else:
+                text_content = result.get('text', '')
             return PlainTextResponse(content=text_content.strip())
         elif response_format == "srt":
-            # Generate SRT format
+            # Generate SRT format respecting timestamp_granularities
             segments = result.get('result', {}).get('segments', [])
             srt_content = ""
-            for i, segment in enumerate(segments, 1):
-                start_time = segment.get('start', 0)
-                end_time = segment.get('end', 0)
-                text = segment.get('text', '').strip()
-                start_srt = f"{int(start_time//3600):02d}:{int((start_time%3600)//60):02d}:{start_time%60:06.3f}".replace('.', ',')
-                end_srt = f"{int(end_time//3600):02d}:{int((end_time%3600)//60):02d}:{end_time%60:06.3f}".replace('.', ',')
-                srt_content += f"{i}\n{start_srt} --> {end_srt}\n{text}\n\n"
+            
+            if segments:
+                # Segment-level SRT: one subtitle per segment
+                logger.info(f"Generating segment-level SRT from {len(segments)} segments")
+                for i, segment in enumerate(segments, 1):
+                    start_time = segment.get('start', 0)
+                    end_time = segment.get('end', 0)
+                    text = segment.get('text', '').strip()
+                    
+                    # Add speaker label if available
+                    speaker = segment.get('speaker')
+                    if speaker:
+                        text = f"[{speaker}] {text}"
+                    
+                    start_srt = f"{int(start_time//3600):02d}:{int((start_time%3600)//60):02d}:{start_time%60:06.3f}".replace('.', ',')
+                    end_srt = f"{int(end_time//3600):02d}:{int((end_time%3600)//60):02d}:{end_time%60:06.3f}".replace('.', ',')
+                    srt_content += f"{i}\n{start_srt} --> {end_srt}\n{text}\n\n"
+            
+            elif 'result' in result and 'words' in result['result']:
+                # Word-level SRT: one subtitle per word
+                words = result['result']['words']
+                logger.info(f"Generating word-level SRT from {len(words)} words")
+                for i, word in enumerate(words, 1):
+                    start_time = word.get('start', 0)
+                    end_time = word.get('end', word.get('start', 0))
+                    text = word.get('word', word.get('text', '')).strip()
+                    
+                    # Add speaker label if available
+                    speaker = word.get('speaker')
+                    if speaker:
+                        text = f"[{speaker}] {text}"
+                    
+                    start_srt = f"{int(start_time//3600):02d}:{int((start_time%3600)//60):02d}:{start_time%60:06.3f}".replace('.', ',')
+                    end_srt = f"{int(end_time//3600):02d}:{int((end_time%3600)//60):02d}:{end_time%60:06.3f}".replace('.', ',')
+                    srt_content += f"{i}\n{start_srt} --> {end_srt}\n{text}\n\n"
+            
             return PlainTextResponse(content=srt_content.strip())
         elif response_format == "vtt":
-            # Generate WebVTT format
+            # Generate WebVTT format respecting timestamp_granularities
             segments = result.get('result', {}).get('segments', [])
             vtt_content = "WEBVTT\n\n"
-            for segment in segments:
-                start_time = segment.get('start', 0)
-                end_time = segment.get('end', 0)
-                text = segment.get('text', '').strip()
-                start_vtt = f"{int(start_time//3600):02d}:{int((start_time%3600)//60):02d}:{start_time%60:06.3f}"
-                end_vtt = f"{int(end_time//3600):02d}:{int((end_time%3600)//60):02d}:{end_time%60:06.3f}"
-                vtt_content += f"{start_vtt} --> {end_vtt}\n{text}\n\n"
+            
+            if segments:
+                # Segment-level VTT: one subtitle per segment
+                logger.info(f"Generating segment-level VTT from {len(segments)} segments")
+                for segment in segments:
+                    start_time = segment.get('start', 0)
+                    end_time = segment.get('end', 0)
+                    text = segment.get('text', '').strip()
+                    
+                    # Add speaker label if available
+                    speaker = segment.get('speaker')
+                    if speaker:
+                        text = f"[{speaker}] {text}"
+                    
+                    start_vtt = f"{int(start_time//3600):02d}:{int((start_time%3600)//60):02d}:{start_time%60:06.3f}"
+                    end_vtt = f"{int(end_time//3600):02d}:{int((end_time%3600)//60):02d}:{end_time%60:06.3f}"
+                    vtt_content += f"{start_vtt} --> {end_vtt}\n{text}\n\n"
+            
+            elif 'result' in result and 'words' in result['result']:
+                # Word-level VTT: one subtitle per word
+                words = result['result']['words']
+                logger.info(f"Generating word-level VTT from {len(words)} words")
+                for word in words:
+                    start_time = word.get('start', 0)
+                    end_time = word.get('end', word.get('start', 0))
+                    text = word.get('word', word.get('text', '')).strip()
+                    
+                    # Add speaker label if available
+                    speaker = word.get('speaker')
+                    if speaker:
+                        text = f"[{speaker}] {text}"
+                    
+                    start_vtt = f"{int(start_time//3600):02d}:{int((start_time%3600)//60):02d}:{start_time%60:06.3f}"
+                    end_vtt = f"{int(end_time//3600):02d}:{int((end_time%3600)//60):02d}:{end_time%60:06.3f}"
+                    vtt_content += f"{start_vtt} --> {end_vtt}\n{text}\n\n"
+            
             return PlainTextResponse(content=vtt_content.strip())
         else:
             # Default: return as JSON

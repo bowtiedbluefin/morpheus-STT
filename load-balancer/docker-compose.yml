@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   load-balancer:
-    image: kylecohen01/whisper-load-balancer:0.1
+    image: kylecohen01/whisper-load-balancer:0.2
     container_name: whisperx-load-balancer
     ports:
       - "8080:8080"

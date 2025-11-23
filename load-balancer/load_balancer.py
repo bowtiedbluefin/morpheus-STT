@@ -55,10 +55,12 @@ class InstanceHealth:
     """Health status of a backend instance"""
     url: str
     is_healthy: bool = True
-    active_jobs: int = 0
+    active_transcriptions: int = 0  # Total load: queued + running transcriptions
+    active_jobs: int = 0  # Legacy: async jobs only (kept for backward compatibility)
     last_check: Optional[datetime] = None
     consecutive_failures: int = 0
     error_message: Optional[str] = None
+    pending_requests: int = 0  # Track requests we've routed but not yet completed
 
 
 class LoadBalancer:
@@ -113,19 +115,21 @@ class LoadBalancer:
             if response.status_code == 200:
                 health_data = response.json()
                 
-                # Extract active_jobs from health response
-                # It's nested under concurrency.active_jobs
+                # Extract metrics from health response
+                # Prioritize active_transcriptions (total load) over active_jobs (async only)
                 concurrency_data = health_data.get('concurrency', {})
+                active_transcriptions = concurrency_data.get('active_transcriptions', 0)
                 active_jobs = concurrency_data.get('active_jobs', 0)
                 
                 # Update instance health
                 instance.is_healthy = True
+                instance.active_transcriptions = active_transcriptions
                 instance.active_jobs = active_jobs
                 instance.last_check = datetime.now()
                 instance.consecutive_failures = 0
                 instance.error_message = None
                 
-                logger.debug(f"{instance_url}: healthy, {active_jobs} active jobs")
+                logger.debug(f"{instance_url}: healthy, {active_transcriptions} active transcriptions, {active_jobs} async jobs")
             else:
                 raise Exception(f"HTTP {response.status_code}")
                 
@@ -145,7 +149,9 @@ class LoadBalancer:
                 
     def get_best_instance(self) -> Optional[str]:
         """
-        Get the instance with the fewest active jobs.
+        Get the instance with the fewest active transcriptions.
+        Combines actual active_transcriptions (queued + running) from health checks 
+        with pending_requests to handle simultaneous requests properly.
         Returns None if no healthy instances are available.
         """
         healthy_instances = [
@@ -158,11 +164,16 @@ class LoadBalancer:
             logger.error("No healthy instances available!")
             return None
             
-        # Sort by active_jobs (ascending) to get instance with fewest jobs
-        best_instance = min(healthy_instances, key=lambda x: x[1].active_jobs)
+        # Sort by total load: active_transcriptions (queued + running) + pending_requests (tracked locally)
+        # This ensures simultaneous requests get distributed across instances
+        best_instance = min(
+            healthy_instances, 
+            key=lambda x: x[1].active_transcriptions + x[1].pending_requests
+        )
         
         logger.info(
-            f"Selected {best_instance[0]} with {best_instance[1].active_jobs} active jobs"
+            f"Selected {best_instance[0]} with {best_instance[1].active_transcriptions} active transcriptions "
+            f"+ {best_instance[1].pending_requests} pending requests"
         )
         
         return best_instance[0]
@@ -172,12 +183,17 @@ class LoadBalancer:
         return {
             "total_instances": len(self.instances),
             "healthy_instances": sum(1 for i in self.instances.values() if i.is_healthy),
+            "total_active_transcriptions": sum(i.active_transcriptions for i in self.instances.values()),
             "total_active_jobs": sum(i.active_jobs for i in self.instances.values()),
+            "total_pending_requests": sum(i.pending_requests for i in self.instances.values()),
             "instances": [
                 {
                     "url": url,
                     "is_healthy": inst.is_healthy,
+                    "active_transcriptions": inst.active_transcriptions,
                     "active_jobs": inst.active_jobs,
+                    "pending_requests": inst.pending_requests,
+                    "total_load": inst.active_transcriptions + inst.pending_requests,
                     "last_check": inst.last_check.isoformat() if inst.last_check else None,
                     "consecutive_failures": inst.consecutive_failures,
                     "error_message": inst.error_message
@@ -194,6 +210,7 @@ class LoadBalancer:
         """
         Proxy request to the best available instance.
         Pure pass-through - sends exact request and returns exact response.
+        Tracks pending requests to distribute simultaneous requests properly.
         """
         # Get best instance
         instance_url = self.get_best_instance()
@@ -203,6 +220,9 @@ class LoadBalancer:
                 status_code=503,
                 detail="No healthy backend instances available"
             )
+        
+        # Increment pending requests counter for this instance
+        self.instances[instance_url].pending_requests += 1
         
         try:
             # Get the raw request body
@@ -244,6 +264,9 @@ class LoadBalancer:
                 status_code=502,
                 detail=f"Backend request failed: {str(e)}"
             )
+        finally:
+            # Decrement pending requests counter when done
+            self.instances[instance_url].pending_requests -= 1
 
 
 # Initialize FastAPI app

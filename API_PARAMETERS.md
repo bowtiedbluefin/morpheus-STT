@@ -16,7 +16,7 @@
 |-----------|------|---------|-------------|---------|
 | `language` | String | "en" | Language code (ISO-639-1) | "en", "es", "fr" |
 | `response_format` | String | "json" | Output format | "json", "verbose_json", "text", "srt", "vtt" |
-| `timestamp_granularities[]` | Array | ["segment"] | Timestamp detail level | ["segment"], ["word"], ["segment", "word"] |
+| `timestamp_granularities` | String | "segment" | Timestamp granularity (comma-separated for multiple) | "segment", "word", "segment,word" |
 
 ### Output Storage Parameters
 | Parameter | Type | Default | Description | Example |
@@ -35,19 +35,23 @@
 | Parameter | Type | Default | Description | Example |
 |-----------|------|---------|-------------|---------|
 | `output_content` | String | "both" | Response content control | "text_only", "timestamps_only", "both", "metadata_only" |
-| `enable_diarization` | Boolean | false | Enable speaker identification | true, false |
-| `min_speakers` | Integer | None | Minimum speakers for diarization | 2 |
-| `max_speakers` | Integer | None | Maximum speakers for diarization | 5 |
+| `enable_diarization` | Boolean | **true** | Enable speaker identification | true, false |
+| `prompt` | String | "" | Optional text prompt to guide transcription | "John Smith, Microsoft, API" |
 
+### Fine-Tuning Parameters
+| Parameter | Type | Default | Description | Range |
+|-----------|------|---------|-------------|-------|
+| `batch_size` | Integer | 16 | Batch size for processing (higher = faster but more memory) | 1-32 |
+| `clustering_threshold` | Float | 0.7 | Speaker clustering threshold (lower = more speakers) | 0.5-1.0 |
+| `segmentation_threshold` | Float | 0.45 | Voice activity detection threshold | 0.1-0.9 |
+| `min_speaker_duration` | Float | 3.0 | Minimum speaking time per speaker (seconds) | 1.0-10.0 |
+| `speaker_confidence_threshold` | Float | 0.6 | Minimum confidence for speaker assignment | 0.1-1.0 |
+| `speaker_smoothing_enabled` | Boolean | true | Enable speaker transition smoothing | true, false |
+| `min_switch_duration` | Float | 2.0 | Minimum time between speaker switches (seconds) | 0.5-5.0 |
+| `vad_validation_enabled` | Boolean | false | Enable Voice Activity Detection validation (experimental) | true, false |
+| `optimized_alignment` | Boolean | true | Use WAV2VEC2 alignment (true) or Whisper alignment (false) | true, false |
 
-### Legacy Parameters (Present but NOT used by WhisperX)
-| Parameter | Type | Default | Description | Status |
-|-----------|------|---------|-------------|--------|
-| `model` | String | "large-v2" | Model identifier | ⚠️ Silently ignored if provided (always uses large-v3) |
-| `temperature` | Float | 0.0 | Sampling temperature | ⚠️ Silently ignored if provided |
-| `enable_profanity_filter` | Boolean | false | Profanity filtering | ⚠️ Accepted but not implemented |
-
-**Note**: `model` and `temperature` parameters are not shown in the Swagger UI but are handled gracefully if sent by legacy clients.
+**Note**: `model` and `temperature` parameters are handled gracefully if sent by legacy clients but are not used.
 
 ## Parameter Details
 
@@ -58,10 +62,10 @@
 - **`srt`**: SubRip subtitle format
 - **`vtt`**: WebVTT subtitle format
 
-### `timestamp_granularities[]` Options
+### `timestamp_granularities` Options
 - **`segment`**: Sentence/phrase level timestamps
 - **`word`**: Individual word timestamps with confidence scores
-- **`["segment", "word"]`**: Both segment and word-level timestamps
+- **`segment,word`**: Both segment and word-level timestamps (comma-separated)
 
 ### `output_content` Options
 - **`text_only`**: Only transcribed text, no timestamps
@@ -261,18 +265,32 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@audio.wav"
 ```
 
-### With All Parameters
+### With All Core Parameters
 ```bash
 curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "file=@audio.wav" \
   -F "language=en" \
   -F "response_format=verbose_json" \
-  -F "timestamp_granularities[]=word" \
+  -F "timestamp_granularities=word" \
   -F "output_content=both" \
   -F "enable_diarization=true" \
-  -F "min_speakers=2" \
-  -F "max_speakers=5" \
-  -F "output_content=both"
+  -F "prompt=Technical meeting with John Smith"
+```
+
+### With Fine-Tuning Parameters
+```bash
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "enable_diarization=true" \
+  -F "batch_size=16" \
+  -F "clustering_threshold=0.7" \
+  -F "segmentation_threshold=0.45" \
+  -F "min_speaker_duration=3.0" \
+  -F "speaker_confidence_threshold=0.6" \
+  -F "speaker_smoothing_enabled=true" \
+  -F "min_switch_duration=2.0" \
+  -F "vad_validation_enabled=false" \
+  -F "optimized_alignment=true"
 ```
 
 ### Text Only Output
@@ -289,20 +307,6 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
   -F "response_format=srt" \
   -F "enable_diarization=true"
 ```
-
-## Requirements for Features
-
-### Speaker Diarization
-- **Hugging Face Token**: Required, free account
-- **GPU Memory**: Additional ~2GB VRAM
-- **Audio Quality**: Clear speech with distinguishable speakers
-- **Audio Length**: Works best with 30+ seconds
-
-### Profanity Filter
-- **No additional requirements**
-- **Language Support**: Primarily English
-- **Performance**: Minimal impact
-
 
 ## Testing the API
 
@@ -327,17 +331,19 @@ curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
 
 The system now includes state-of-the-art speaker diarization capabilities with configurable parameters for optimal accuracy.
 
-### Speaker Recognition Configuration
+### API Parameter Reference
 
-| Parameter | Type | Range | Default | Description |
-|-----------|------|-------|---------|-------------|
-| `PYANNOTE_CLUSTERING_THRESHOLD` | float | 0.3-1.0 | 0.7 | Controls speaker clustering aggressiveness. Higher = fewer speakers |
-| `PYANNOTE_SEGMENTATION_THRESHOLD` | float | 0.1-1.0 | 0.45 | Speech detection sensitivity for segmentation |
-| `SPEAKER_CONFIDENCE_THRESHOLD` | float | 0.0-1.0 | 0.6 | Minimum confidence for speaker assignment (SR-TH) |
-| `MIN_SPEAKER_DURATION` | float | 1.0-10.0 | 3.0 | Minimum speaking time for valid speaker |
-| `SPEAKER_SMOOTHING_ENABLED` | boolean | - | true | Reduce rapid speaker switches (A→B→A patterns) |
-| `MIN_SWITCH_DURATION` | float | 0.5-5.0 | 2.0 | Minimum seconds between speaker changes |
-| `VAD_VALIDATION_ENABLED` | boolean | - | false | Cross-validate with Voice Activity Detection |
+All fine-tuning parameters listed above are available as API parameters. You can also set them as environment variables for server-wide defaults:
+
+| API Parameter | Environment Variable | Type | Range | Default | Description |
+|---------------|---------------------|------|-------|---------|-------------|
+| `clustering_threshold` | `PYANNOTE_CLUSTERING_THRESHOLD` | float | 0.3-1.0 | 0.7 | Controls speaker clustering aggressiveness. Higher = fewer speakers |
+| `segmentation_threshold` | `PYANNOTE_SEGMENTATION_THRESHOLD` | float | 0.1-1.0 | 0.45 | Speech detection sensitivity for segmentation |
+| `speaker_confidence_threshold` | `SPEAKER_CONFIDENCE_THRESHOLD` | float | 0.0-1.0 | 0.6 | Minimum confidence for speaker assignment (SR-TH) |
+| `min_speaker_duration` | `MIN_SPEAKER_DURATION` | float | 1.0-10.0 | 3.0 | Minimum speaking time for valid speaker |
+| `speaker_smoothing_enabled` | `SPEAKER_SMOOTHING_ENABLED` | boolean | - | true | Reduce rapid speaker switches (A→B→A patterns) |
+| `min_switch_duration` | `MIN_SWITCH_DURATION` | float | 0.5-5.0 | 2.0 | Minimum seconds between speaker changes |
+| `vad_validation_enabled` | `VAD_VALIDATION_ENABLED` | boolean | - | false | Cross-validate with Voice Activity Detection |
 
 ### Enhanced Response Format
 
@@ -431,22 +437,20 @@ The diarization system returns enhanced speaker attribution with word-level conf
 - `optimization_layers_applied`: Number of optimization layers processed
 - `gpu_memory_used`: GPU memory consumption during processing
 
-### Diarization Quality Indicators
-
-#### Confidence Score Interpretation
-- **≥0.9**: Excellent - Very reliable speaker assignment
-- **0.7-0.89**: Good - Reliable with minor uncertainty
-- **0.5-0.69**: Fair - Moderate confidence, review recommended  
-- **<0.5**: Poor - Low confidence, likely misattribution
-
-#### Speaker Count Accuracy
-- The system achieves **95%+ accuracy** in speaker count detection
-- **94.9% average timeline consistency** for speaker attribution
-- Advanced 6-layer optimization stack prevents over/under-detection
-
 ### Parameter Tuning Guidelines
 
 #### Over-Detection Issues (Too Many Speakers)
+**Via API Parameters:**
+```bash
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "enable_diarization=true" \
+  -F "clustering_threshold=0.8" \
+  -F "speaker_confidence_threshold=0.8" \
+  -F "min_speaker_duration=5.0"
+```
+
+**Via Environment Variables (server-wide defaults):**
 ```bash
 export PYANNOTE_CLUSTERING_THRESHOLD=0.8    # Increase from 0.7
 export SPEAKER_CONFIDENCE_THRESHOLD=0.8     # Increase from 0.6  
@@ -454,6 +458,17 @@ export MIN_SPEAKER_DURATION=5.0             # Increase from 3.0
 ```
 
 #### Under-Detection Issues (Too Few Speakers)
+**Via API Parameters:**
+```bash
+curl -X POST "http://localhost:3333/v1/audio/transcriptions" \
+  -F "file=@audio.wav" \
+  -F "enable_diarization=true" \
+  -F "clustering_threshold=0.5" \
+  -F "speaker_confidence_threshold=0.4" \
+  -F "vad_validation_enabled=true"
+```
+
+**Via Environment Variables:**
 ```bash
 export PYANNOTE_CLUSTERING_THRESHOLD=0.5    # Decrease from 0.7
 export SPEAKER_CONFIDENCE_THRESHOLD=0.4     # Decrease from 0.6
