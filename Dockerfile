@@ -1,19 +1,8 @@
 # --- Builder Stage ---
 FROM python:3.12-slim AS builder
 
-# Install build dependencies (FFmpeg libs required for PyAV)
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    git \
-    pkg-config \
-    libavformat-dev \
-    libavcodec-dev \
-    libavdevice-dev \
-    libavutil-dev \
-    libavfilter-dev \
-    libswscale-dev \
-    libswresample-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Install build dependencies
+RUN apt-get update && apt-get install -y build-essential git
 
 # Set up working directory
 WORKDIR /app
@@ -29,7 +18,7 @@ RUN pip install --no-cache-dir --prefix="/install" psutil && \
 
 # Install remaining packages including text processing libraries and pyannote.audio
 RUN pip install --no-cache-dir --prefix="/install" "transformers>=4.54.0" && \
-    grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" | grep -v "^tokenizers" | grep -v "^transformers" > requirements_filtered.txt && \
+    grep -v "profanity" requirements.txt | grep -v "cu11" | grep -v "^torch" | grep -v "^ctranslate2" | grep -v "whisperx" | grep -v "^tokenizers" | grep -v "^transformers" | grep -v "^av" > requirements_filtered.txt && \
     pip install --no-cache-dir --prefix="/install" --upgrade-strategy only-if-needed -r requirements_filtered.txt
 
 # --- Final Stage ---  
